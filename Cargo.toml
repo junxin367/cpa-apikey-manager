@@ -1,0 +1,29 @@
+[package]
+name = "cpa-apikey-manager"
+version = "0.1.0"
+edition = "2021"
+description = "CLIProxyAPI client API key model permissions and recurring quotas"
+license = "MIT"
+repository = "https://github.com/junxin367/cpa-apikey-manager"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+hex = "0.4"
+hmac = "0.12"
+iana-time-zone = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,25 @@
+# 将本段合并到现有 CLIProxyAPI 配置，不要替换整个宿主配置文件。
+# Windows 路径建议使用正斜杠；Linux 路径示例：/opt/cliproxy/config.yaml。
+# 客户端密钥继续由宿主的 access.api-keys（或旧版 api-keys 字符串列表）管理。
+plugins:
+  enabled: true
+  dir: "./plugins"
+  configs:
+    cpa-apikey-manager:
+      enabled: true
+      priority: 0
+      # 必填：正在运行的宿主所使用的配置文件绝对路径。
+      cpa-config-path: "C:/CLIProxyAPI/config.yaml"
+      # 用于同步模型目录，只请求 /v1/models，不执行模型推理。
+      cpa-base-url: "http://127.0.0.1:8317"
+      # 推荐绝对路径。备份此目录即备份账本、规则及密钥 HMAC 标识密钥。
+      data-dir: "C:/CLIProxyAPI/data/cpa-apikey-manager"
+      # 周期在管理页面按密钥设置；重置时间使用宿主服务器的系统时区。
+      # 自动同步只补全未设置的价格，已有价格（包括 0 价格）不会被覆盖。
+      price-sync:
+        enabled: true
+        interval-hours: 6
+        # 以下地址可省略；如需镜像地址，可在这里修改。空字符串表示停用该来源。
+        models-dev-url: "https://models.dev/catalog.json"
+        litellm-url: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+        openrouter-url: "https://openrouter.ai/api/v1/models"

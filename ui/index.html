@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CPA · 密钥权限与额度</title>
+  <link rel="stylesheet" href="app.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <div id="login" class="login-wrap">
+    <form id="login-form" class="login-card">
+      <span class="brand-mark" data-icon="shield"></span>
+      <h1>密钥权限与额度</h1>
+      <p class="muted">登录 CLIProxyAPI 插件管理台。</p>
+      <label for="management-key">管理密钥</label>
+      <input id="management-key" type="password" required autocomplete="off" placeholder="输入 CLIProxyAPI 管理密钥">
+      <button class="primary full" type="submit">进入管理台</button>
+      <p id="login-error" class="error" role="alert"></p>
+      <p class="fine">管理密钥仅保存在当前页面内存中，刷新后需重新登录。</p>
+    </form>
+  </div>
+  <div id="app" class="app-shell" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="index.html"><span class="brand-mark" data-icon="shield"></span><span>CPA 管理台<small>密钥权限与额度</small></span></a>
+      <p class="nav-label">访问管理</p>
+      <nav aria-label="主导航">
+        <button data-view="keys" class="nav-item active" aria-current="page"><span data-icon="key"></span>API 密钥<span id="key-count" class="nav-count">0</span></button>
+        <button data-view="prices" class="nav-item"><span data-icon="coins"></span>模型价格</button>
+      </nav>
+      <div class="sidebar-bottom"><span class="status-dot"></span><span>独立插件</span><small id="version"></small></div>
+    </aside>
+    <main class="workspace">
+      <header class="topbar">
+        <b id="breadcrumb">API 密钥</b>
+        <div class="top-actions"><span class="tz-chip"><span data-icon="clock"></span><span id="timezone"></span></span><button id="refresh" class="ghost"><span data-icon="refresh"></span>刷新数据</button><button id="logout" class="ghost"><span data-icon="logout"></span>退出</button></div>
+      </header>
+      <div id="system-error" class="banner error" role="alert" hidden></div>
+      <section id="keys-view" class="page">
+        <div class="page-heading"><div><h1>API 密钥</h1><p class="muted">选择密钥，配置模型权限与额度。每把密钥独立设置重置周期。</p></div><span class="outline-tag"><span data-icon="shield"></span>从宿主只读同步</span></div>
+        <div id="keys-unavailable" class="panel empty" hidden><span data-icon="info"></span><h2>暂时无法读取宿主密钥</h2><p id="keys-unavailable-reason"></p><p>请检查宿主配置路径与读取权限，再点击顶部“刷新数据”。</p></div>
+        <div id="keys-content"><div class="stats">
+          <div class="stat"><span>有效密钥</span><strong id="stat-keys">0</strong><small>从当前宿主同步</small><span class="stat-icon" data-icon="key"></span></div>
+          <div class="stat"><span>可配置模型</span><strong id="stat-models">0</strong><small>支持实际模型与别名</small><span class="stat-icon" data-icon="models"></span></div>
+          <div class="stat"><span>已配置规则</span><strong id="stat-rules">0</strong><small>未配置的模型直接放行</small><span class="stat-icon" data-icon="shield"></span></div>
+        </div>
+        <div class="key-layout">
+          <section class="panel key-list-panel">
+            <div class="panel-title"><h2>密钥列表</h2><span class="badge neutral">只读</span></div>
+            <label class="sr-only" for="key-search">搜索密钥或备注</label><input id="key-search" class="search" placeholder="搜索密钥或备注">
+            <div id="key-list"></div>
+          </section>
+          <section class="panel detail-panel">
+            <div id="key-empty" class="empty"><span data-icon="key"></span><h2>选择一把密钥</h2><p>从密钥列表选择一项，开始配置权限与额度。</p></div>
+            <div id="key-detail" hidden>
+              <div class="detail-heading"><div><h2 id="selected-key"></h2><p class="fine"><span id="selected-mask"></span> <span id="key-status" class="badge"></span></p></div><div class="policy-actions"><div><button id="discard" class="secondary" disabled>放弃修改</button><button id="save-policy" class="primary" disabled>保存配置</button></div><span id="dirty-state" class="fine" aria-live="polite">所有更改已保存</span></div></div>
+              <div class="policy-controls">
+                <label class="note-field">密钥备注<input id="key-note" maxlength="100" placeholder="例如：开发团队"></label>
+                <label class="cycle-field">额度周期<select id="key-period"><option value="day">每天</option><option value="week">每周</option><option value="month">每月</option></select></label>
+                <p id="period-note" class="fine period-note"></p>
+              </div>
+              <div class="section-toolbar"><div><h3>模型权限与额度</h3><p class="fine">未配置的模型直接放行，同一密钥共用上方周期。</p></div><div class="toolbar-actions"><button id="sync-models" class="secondary"><span data-icon="refresh"></span>同步模型</button><button id="add-model" class="secondary"><span data-icon="plus"></span>添加模型</button></div></div>
+              <div class="filters"><label class="sr-only" for="model-search">搜索模型</label><input id="model-search" placeholder="搜索模型 ID"><div id="family-filters" class="segments" aria-label="模型分组"></div></div>
+              <div class="table-scroll" tabindex="0" role="region" aria-label="模型权限与额度表格"><table class="model-table"><thead><tr><th>模型</th><th>权限</th><th>额度上限</th><th>本周期已用</th><th>操作</th></tr></thead><tbody id="model-rows"></tbody></table></div>
+              <div id="no-models" class="empty compact" hidden></div>
+              <p class="notice"><span data-icon="info"></span><span>额度耗尽后阻止新请求；已放行请求会继续结算，可能超出上限。</span></p>
+            </div>
+          </section>
+        </div>
+        </div>
+      </section>
+      <section id="prices-view" class="page" hidden>
+        <div class="page-heading"><div><h1>模型价格</h1><p class="muted">自动补全缺失价格，已有价格保持不变。单位：USD / 百万 Token。</p></div><button id="sync-prices" class="primary">同步缺失价格</button></div>
+        <div class="panel price-sync-panel" aria-live="polite">
+          <div class="price-sync-copy"><span data-icon="refresh"></span><div><strong id="price-sync-status">正在读取同步状态</strong><p id="price-sync-detail" class="fine"></p></div></div>
+          <span id="price-coverage" class="badge"></span>
+        </div>
+        <div class="panel price-panel">
+          <div class="filters price-filters"><label class="sr-only" for="price-search">搜索价格模型</label><input id="price-search" placeholder="搜索模型 ID"><label class="sr-only" for="price-filter">价格状态</label><select id="price-filter"><option value="all">全部价格</option><option value="missing">待设置</option><option value="automatic">自动同步</option><option value="manual">手动设置</option></select><span id="price-count" class="filter-count"></span></div>
+          <div class="table-scroll" tabindex="0" role="region" aria-label="模型价格表格"><table class="price-table"><thead><tr><th>模型 ID</th><th>输入</th><th>输出</th><th>缓存读取</th><th>缓存写入</th><th>价格来源</th><th>操作</th></tr></thead><tbody id="price-rows"></tbody></table></div>
+          <p class="price-help">按 models.dev → LiteLLM → OpenRouter 的顺序补全基础文本 Token 价格。缓存价留空时沿用输入价；阶梯、优先级和非 Token 收费需自行核对。</p>
+        </div>
+      </section>
+      <footer class="footer">CPA · 密钥权限与额度<span>自然周期重置 · 服务器系统时区</span></footer>
+    </main>
+  </div>
+  <dialog id="dialog" aria-labelledby="dialog-title">
+    <form id="dialog-form">
+      <div class="dialog-header"><div class="dialog-title-group"><span data-icon="info"></span><h2 id="dialog-title"></h2></div><button type="button" id="dialog-close" class="ghost" aria-label="关闭"><span data-icon="close"></span></button></div>
+      <div class="dialog-content"><div id="dialog-body"></div><p id="dialog-error" class="error" role="alert"></p></div>
+      <div id="dialog-actions" class="dialog-actions"><button type="button" id="dialog-cancel" class="secondary">取消</button><button type="submit" id="dialog-confirm" class="primary">确认</button></div>
+      <div id="dialog-discard" class="discard-confirm" hidden><p><span data-icon="info"></span>当前输入尚未保存，确定放弃此次修改？</p><div><button type="button" id="dialog-continue" class="secondary">继续编辑</button><button type="button" id="dialog-abandon" class="primary">放弃修改</button></div></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
