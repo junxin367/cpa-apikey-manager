@@ -37,12 +37,12 @@
       </header>
       <div id="system-error" class="banner error" role="alert" hidden></div>
       <section id="keys-view" class="page">
-        <div class="page-heading"><div><h1>API 密钥</h1><p class="muted">选择密钥，配置模型权限与额度。每把密钥独立设置重置周期。</p></div><span class="outline-tag"><span data-icon="shield"></span>从宿主只读同步</span></div>
+        <div class="page-heading"><div><h1>API 密钥</h1><p class="muted">选择密钥，按需添加全部模型、渠道或单模型限制。每把密钥独立设置重置周期。</p></div><span class="outline-tag"><span data-icon="shield"></span>从宿主只读同步</span></div>
         <div id="keys-unavailable" class="panel empty" hidden><span data-icon="info"></span><h2>暂时无法读取宿主密钥</h2><p id="keys-unavailable-reason"></p><p>请检查宿主配置路径与读取权限，再点击顶部“刷新数据”。</p></div>
         <div id="keys-content"><div class="stats">
           <div class="stat"><span>有效密钥</span><strong id="stat-keys">0</strong><small>从当前宿主同步</small><span class="stat-icon" data-icon="key"></span></div>
           <div class="stat"><span>可配置模型</span><strong id="stat-models">0</strong><small>支持实际模型与别名</small><span class="stat-icon" data-icon="models"></span></div>
-          <div class="stat"><span>已配置规则</span><strong id="stat-rules">0</strong><small>未配置的模型直接放行</small><span class="stat-icon" data-icon="shield"></span></div>
+          <div class="stat"><span>已配置规则</span><strong id="stat-rules">0</strong><small>当前生效的权限与额度规则</small><span class="stat-icon" data-icon="shield"></span></div>
         </div>
         <div class="key-layout">
           <section class="panel key-list-panel">
@@ -59,11 +59,14 @@
                 <label class="cycle-field">额度周期<select id="key-period"><option value="day">每天</option><option value="week">每周</option><option value="month">每月</option></select></label>
                 <p id="period-note" class="fine period-note"></p>
               </div>
-              <div class="section-toolbar"><div><h3>模型权限与额度</h3><p class="fine">未配置的模型直接放行，同一密钥共用上方周期。</p></div><div class="toolbar-actions"><button id="sync-models" class="secondary"><span data-icon="refresh"></span>同步模型</button><button id="add-model" class="secondary"><span data-icon="plus"></span>添加模型</button></div></div>
-              <div class="filters"><label class="sr-only" for="model-search">搜索模型</label><input id="model-search" placeholder="搜索模型 ID"><div id="family-filters" class="segments" aria-label="模型分组"></div></div>
-              <div class="table-scroll" tabindex="0" role="region" aria-label="模型权限与额度表格"><table class="model-table"><thead><tr><th>模型</th><th>权限</th><th>额度上限</th><th>本周期已用</th><th>操作</th></tr></thead><tbody id="model-rows"></tbody></table></div>
-              <div id="no-models" class="empty compact" hidden></div>
-              <p class="notice"><span data-icon="info"></span><span>额度耗尽后阻止新请求；已放行请求会继续结算，可能超出上限。</span></p>
+              <section class="limits-section" aria-labelledby="limits-heading">
+                <div class="section-toolbar limits-toolbar"><div><h3 id="limits-heading">限制设置</h3><p class="fine">仅展示已经添加的限制；未添加的范围默认允许且不限额。</p></div><div class="toolbar-actions"><label class="switch-control"><input id="total-quota-enabled" type="checkbox" role="switch"><span>总额度</span></label><button id="sync-models" class="secondary"><span data-icon="refresh"></span>同步模型</button><button id="add-restriction" class="primary"><span data-icon="plus"></span>添加限制</button></div></div>
+                <p id="limit-mode-note" class="limit-mode-note fine"></p>
+                <div id="limits-empty" class="empty compact"><span data-icon="shield"></span><h2>尚未添加限制</h2><p>可以限制全部模型、一个模型渠道，或单个实际模型。</p><button id="empty-add-restriction" class="primary"><span data-icon="plus"></span>添加第一个限制</button></div>
+                <div id="limits-table-wrap" class="table-scroll" tabindex="0" role="region" aria-label="已添加的限制" hidden><table class="limits-table"><thead><tr><th>限制范围</th><th>权限</th><th>额度上限</th><th>本周期已用</th><th>操作</th></tr></thead><tbody id="limit-rows"></tbody></table></div>
+                <p class="notice"><span data-icon="info"></span><span>额度耗尽后阻止新请求；已放行请求会继续结算，可能超出上限。</span></p>
+                <p id="recording-note" class="notice"></p>
+              </section>
             </div>
           </section>
         </div>

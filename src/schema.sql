@@ -25,8 +25,8 @@ CREATE TABLE IF NOT EXISTS usage(
   failed INTEGER NOT NULL,stream INTEGER NOT NULL,manual INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS usage_period ON usage(key_id,model,started);
+CREATE INDEX IF NOT EXISTS usage_key_period ON usage(key_id,started);
 CREATE INDEX IF NOT EXISTS usage_request ON usage(request_id,model);
 CREATE TABLE IF NOT EXISTS audit(
   id INTEGER PRIMARY KEY,created INTEGER NOT NULL,action TEXT NOT NULL,subject TEXT NOT NULL,detail TEXT NOT NULL
 );
-PRAGMA user_version=1;

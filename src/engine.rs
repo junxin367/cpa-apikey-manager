@@ -1,5 +1,6 @@
 use crate::{
     accounting::{self, Detail, Price, Tokens, MAX_VALUE},
+    channel::{self, Scope},
     config::{self, Config},
 };
 use chrono::{DateTime, Local, Utc};
@@ -66,6 +67,9 @@ impl From<serde_json::Error> for Fault {
 fn default_period() -> String {
     "day".into()
 }
+fn default_rule_mode() -> String {
+    "model".into()
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Quota {
@@ -107,6 +111,14 @@ pub struct Policy {
     #[serde(default = "default_period")]
     pub period: String,
     #[serde(default)]
+    pub total_quota: Option<Quota>,
+    #[serde(default)]
+    pub total_quota_enabled: bool,
+    #[serde(default = "default_rule_mode")]
+    pub rule_mode: String,
+    #[serde(default)]
+    pub channel_rules: BTreeMap<String, Rule>,
+    #[serde(default)]
     pub rules: BTreeMap<String, Rule>,
 }
 impl Default for Policy {
@@ -115,8 +127,45 @@ impl Default for Policy {
             revision: 0,
             note: String::new(),
             period: default_period(),
+            total_quota: None,
+            total_quota_enabled: false,
+            rule_mode: default_rule_mode(),
+            channel_rules: BTreeMap::new(),
             rules: BTreeMap::new(),
         }
+    }
+}
+impl Policy {
+    fn total(&self) -> Option<&Quota> {
+        self.total_quota
+            .as_ref()
+            .filter(|_| self.total_quota_enabled)
+    }
+    fn scoped_quotas(&self) -> Vec<(Scope<'_>, &Quota)> {
+        let mut quotas = Vec::new();
+        if let Some(quota) = self.total() {
+            quotas.push((Scope::Total, quota));
+        }
+        let rules = if self.rule_mode == "channel" {
+            &self.channel_rules
+        } else {
+            &self.rules
+        };
+        for (id, rule) in rules {
+            if rule.access == "allow" {
+                if let Some(quota) = &rule.quota {
+                    quotas.push((
+                        if self.rule_mode == "channel" {
+                            Scope::Channel(id)
+                        } else {
+                            Scope::Model(id)
+                        },
+                        quota,
+                    ));
+                }
+            }
+        }
+        quotas
     }
 }
 #[derive(Clone)]
@@ -148,9 +197,9 @@ impl Engine {
             fs::set_permissions(&config.data_dir, fs::Permissions::from_mode(0o700))
                 .map_err(|_| Fault::new(503, "storage_unavailable", "无法设置数据目录权限"))?;
         }
-        let db = Connection::open(config.data_dir.join("manager.sqlite3"))?;
+        let mut db = Connection::open(config.data_dir.join("manager.sqlite3"))?;
         db.busy_timeout(Duration::from_secs(5))?;
-        db.execute_batch(include_str!("schema.sql"))?;
+        crate::migrations::initialize(&mut db)?;
         let existing: Option<String> = db
             .query_row("SELECT value FROM meta WHERE name='secret'", [], |r| {
                 r.get(0)
@@ -261,9 +310,14 @@ impl Engine {
                 "••••••••".into()
             };
             tx.execute(
-                "INSERT INTO keys(id,masked,active,policy) VALUES(?1,?2,1,?3)
+                "INSERT INTO keys(id,masked,active,policy,recording_since) VALUES(?1,?2,1,?3,?4)
                 ON CONFLICT(id) DO UPDATE SET masked=excluded.masked,active=1",
-                params![key.id, masked, serde_json::to_string(&Policy::default())?],
+                params![
+                    key.id,
+                    masked,
+                    serde_json::to_string(&Policy::default())?,
+                    Utc::now().to_rfc3339()
+                ],
             )?;
         }
         for model in source.models {
@@ -318,19 +372,35 @@ impl Engine {
         }
     }
     pub fn totals(&self, key: &str, model: &str, start: i64, end: i64) -> Result<Value> {
+        self.scope_totals(
+            key,
+            if model.is_empty() {
+                Scope::Total
+            } else {
+                Scope::Model(model)
+            },
+            start,
+            end,
+        )
+    }
+    fn scope_totals(&self, key: &str, scope: Scope<'_>, start: i64, end: i64) -> Result<Value> {
+        let filter = scope.filter();
+        let value = scope.value();
         let (tokens, cost, unpriced, count): (i64, i64, i64, i64) = self.db.query_row(
-            "SELECT COALESCE(SUM(tokens),0),COALESCE(SUM(cost),0),
+            &format!(
+                "SELECT COALESCE(SUM(tokens),0),COALESCE(SUM(cost),0),
              COALESCE(SUM(CASE WHEN cost IS NULL THEN 1 ELSE 0 END),0),COUNT(*)
-             FROM usage WHERE key_id=?1 AND model=?2 AND started>=?3 AND started<?4",
-            params![key, model, start, end],
+             FROM usage WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4"
+            ),
+            params![key, value, start, end],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         let pending: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM requests WHERE key_id=?1 AND model=?2 AND started>=?3 AND started<?4 AND status IN ('pending','review')",
-            params![key, model, start, end], |r| r.get(0))?;
+            &format!("SELECT COUNT(*) FROM requests WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4 AND status IN ('pending','review')"),
+            params![key, value, start, end], |r| r.get(0))?;
         let review: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM requests WHERE key_id=?1 AND model=?2 AND status='review'",
-            params![key, model],
+            &format!("SELECT COUNT(*) FROM requests WHERE key_id=?1 AND {filter} AND ?2 IS NOT NULL AND status='review'"),
+            params![key, value],
             |r| r.get(0),
         )?;
         Ok(
@@ -373,6 +443,15 @@ impl Engine {
         if policy.rules.len() > 1000 {
             return Err("单个密钥最多配置 1000 条模型规则".into());
         }
+        if !["model", "channel"].contains(&policy.rule_mode.as_str()) {
+            return Err("配置方式必须是 model 或 channel".into());
+        }
+        if policy.total_quota_enabled && policy.total_quota.is_none() {
+            return Err("启用总额度前请设置单位和上限；移除上限前请先关闭总额度".into());
+        }
+        if let Some(quota) = &policy.total_quota {
+            quota.amount()?;
+        }
         let mut canonical_rules = BTreeMap::new();
         let mut updates: Vec<(String, i64)> = Vec::new();
         let mut preview_cost = 0_i64;
@@ -390,35 +469,80 @@ impl Engine {
                 if self.aliases.get(name).is_some_and(|v| v.len() > 1) {
                     return Err("该别名对应多个实际模型，请分别配置目标模型的额度".into());
                 }
-                if quota.unit == "money" {
-                    let price = self.price(&model)?.ok_or("请先为该模型设置价格")?;
-                    let (start, end) =
-                        accounting::period_bounds(now, self.timezone(), &policy.period)?;
-                    let unpriced_pending: i64 = self.db.query_row("SELECT COUNT(*) FROM requests
-                        WHERE key_id=?1 AND model=?2 AND started>=?3 AND started<?4 AND price IS NULL AND status IN ('pending','review')",
-                        params![key,model,start,end], |r| r.get(0))?;
-                    if unpriced_pending > 0 {
-                        return Err(Fault::new(
-                            409,
-                            "pending_usage",
-                            "仍有未计价的执行中或待核对请求，处理后才能启用金额额度",
-                        ));
-                    }
-                    let mut stmt = self.db.prepare("SELECT id,detail FROM usage WHERE key_id=?1 AND model=?2 AND started>=?3 AND started<?4 AND cost IS NULL")?;
-                    let rows = stmt.query_map(params![key, model, start, end], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                    })?;
-                    for row in rows {
-                        let (id, detail) = row?;
-                        let tokens: Tokens = serde_json::from_str(&detail)?;
-                        let cost = price.cost(&tokens)?;
-                        preview_cost =
-                            preview_cost.checked_add(cost).ok_or("补计总金额超出范围")?;
-                        updates.push((id, cost));
-                    }
+                if quota.unit == "money" && policy.rule_mode == "model" && rule.access == "allow" {
+                    self.price(&model)?.ok_or("请先为该模型设置价格")?;
                 }
             }
             canonical_rules.insert(model, rule.clone());
+        }
+        for (id, rule) in &policy.channel_rules {
+            if !channel::valid(id) {
+                return Err("未知的渠道 ID".into());
+            }
+            if !["allow", "deny"].contains(&rule.access.as_str()) {
+                return Err("渠道权限必须是 allow 或 deny".into());
+            }
+            if let Some(quota) = &rule.quota {
+                quota.amount()?;
+            }
+        }
+        policy.rules = canonical_rules;
+        // Total money subsumes all narrower scopes; otherwise active scopes are disjoint.
+        let money_scopes: Vec<_> = if policy.total().is_some_and(|q| q.unit == "money") {
+            vec![Scope::Total]
+        } else {
+            policy
+                .scoped_quotas()
+                .into_iter()
+                .filter(|(_, q)| q.unit == "money")
+                .map(|(scope, _)| scope)
+                .collect()
+        };
+        let (start, end) = accounting::period_bounds(now, self.timezone(), &policy.period)?;
+        let mut prices = BTreeMap::new();
+        for scope in money_scopes {
+            let filter = scope.filter();
+            let unpriced_pending: i64 = self.db.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM requests
+                WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4
+                AND price IS NULL AND status IN ('pending','review')"
+                ),
+                params![key, scope.value(), start, end],
+                |r| r.get(0),
+            )?;
+            if unpriced_pending > 0 {
+                return Err(Fault::new(
+                    409,
+                    "pending_usage",
+                    "额度范围内仍有未计价的执行中或待核对请求，处理后才能启用金额额度",
+                ));
+            }
+            let mut stmt = self.db.prepare(&format!(
+                "SELECT id,model,detail FROM usage
+                WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4 AND cost IS NULL"
+            ))?;
+            let rows = stmt.query_map(params![key, scope.value(), start, end], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, actual, detail) = row?;
+                if !prices.contains_key(&actual) {
+                    let price = self.price(&actual)?.ok_or_else(|| Fault::new(
+                        409, "unpriced_usage",
+                        format!("模型「{actual}」存在未计价用量，请先在「模型价格」中补全价格，再保存金额额度。"),
+                    ))?;
+                    prices.insert(actual.clone(), price);
+                }
+                let tokens: Tokens = serde_json::from_str(&detail)?;
+                let cost = prices[&actual].cost(&tokens)?;
+                preview_cost = preview_cost.checked_add(cost).ok_or("补计总金额超出范围")?;
+                updates.push((id, cost));
+            }
         }
         if !updates.is_empty() && !reprice {
             return Err(Fault::new(
@@ -431,7 +555,6 @@ impl Engine {
                 ),
             ));
         }
-        policy.rules = canonical_rules;
         policy.revision = old.revision + 1;
         let tx = self.db.transaction()?;
         for (id, cost) in updates {
@@ -499,6 +622,12 @@ impl Engine {
         })
     }
     fn permitted(policy: &Policy, requested: &str, actual: &str) -> bool {
+        if policy.rule_mode == "channel" {
+            return !policy
+                .channel_rules
+                .get(channel::classify(actual))
+                .is_some_and(|rule| rule.access == "deny");
+        }
         let rules: Vec<_> = [requested, actual]
             .iter()
             .filter_map(|m| policy.rules.get(*m))
@@ -507,6 +636,13 @@ impl Engine {
             return false;
         }
         true
+    }
+    fn denied(policy: &Policy, actual: &str) -> Fault {
+        if policy.rule_mode == "channel" {
+            Fault::new(403, "channel_forbidden", format!("请求被拒绝：当前 API 密钥无权调用渠道「{}」（实际模型「{actual}」）。请联系管理员开通渠道权限。", channel::label(channel::classify(actual))))
+        } else {
+            Fault::model_forbidden(actual)
+        }
     }
     pub fn intercept(&mut self, req: &Value, after: bool, now: DateTime<Utc>) -> Result<Value> {
         self.sync()?;
@@ -534,8 +670,15 @@ impl Engine {
         {
             // Token counting has no generation cost, but still enforces model permissions.
             let policy = self.policy(&key)?;
-            if !Self::permitted(&policy, requested, &self.canonical(requested)) {
-                return Err(Fault::model_forbidden(&self.canonical(requested)));
+            let targets = self
+                .aliases
+                .get(requested)
+                .cloned()
+                .unwrap_or_else(|| vec![self.canonical(requested)]);
+            for target in targets {
+                if !Self::permitted(&policy, requested, &target) {
+                    return Err(Self::denied(&policy, &target));
+                }
             }
             return Ok(json!({}));
         }
@@ -545,8 +688,8 @@ impl Engine {
             self.canonical(requested)
         };
         let policy = self.policy(&key)?;
-        if !Self::permitted(&policy, requested, &actual) {
-            return Err(Fault::model_forbidden(&actual));
+        if (after || policy.rule_mode == "model") && !Self::permitted(&policy, requested, &actual) {
+            return Err(Self::denied(&policy, &actual));
         }
         if !after {
             return Ok(json!({}));
@@ -557,47 +700,36 @@ impl Engine {
         if added == 1 {
             self.schedule_price_sync();
         }
-        // An unconfigured model passes through and creates no pending accounting obligation.
-        if policy
-            .rules
-            .get(&actual)
-            .and_then(|rule| rule.quota.as_ref())
-            .is_none()
-        {
-            return Ok(json!({}));
-        }
+        // All admitted generations are recorded, independently of active limits.
         self.expire_pending(now)?;
-        let review: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM requests WHERE key_id=?1 AND model=?2 AND status='review'",
-            params![key, actual],
-            |r| r.get(0),
-        )?;
-        if review > 0 {
-            return Err(Fault::new(
-                503,
-                "usage_needs_review",
-                format!("请求被拒绝：模型「{actual}」有 {review} 个请求的用量待核对，已暂停当前密钥对该模型的调用。请联系管理员在「API 密钥 → 对应模型 → 处理待核对」中完成核对后重试。"),
-            ));
-        }
-        if let Some(quota) = policy.rules.get(&actual).and_then(|r| r.quota.as_ref()) {
+        let actual_channel = channel::classify(&actual);
+        let applicable: Vec<_> = policy
+            .scoped_quotas()
+            .into_iter()
+            .filter(|(scope, _)| match scope {
+                Scope::Total => true,
+                Scope::Model(id) => *id == actual,
+                Scope::Channel(id) => *id == actual_channel,
+            })
+            .collect();
+        for (scope, quota) in &applicable {
             let timezone = self.timezone();
             let timezone_label = server_timezone_name();
             let (start, end) = accounting::period_bounds(now, timezone, &policy.period)?;
-            let totals = self.totals(&key, &actual, start, end)?;
+            let totals = self.scope_totals(&key, *scope, start, end)?;
+            let review = totals["review"].as_i64().unwrap_or(0);
+            if review > 0 {
+                return Err(Fault::new(503, "usage_needs_review", format!(
+                    "请求被拒绝：{}有 {review} 个请求的用量待核对，无法核算额度。请在「API 密钥」对应额度区域中点击「处理待核对」。", scope.subject())));
+            }
             let used = if quota.unit == "money" {
-                if self.price(&actual)?.is_none() {
-                    return Err(Fault::new(
-                        503,
-                        "unpriced_usage",
-                        format!("请求被拒绝：模型「{actual}」尚未设置价格，无法核算金额额度。请联系管理员在「模型价格」中设置价格后重试。"),
-                    ));
-                }
                 let unpriced = totals["unpriced"].as_i64().unwrap_or(0);
                 if unpriced > 0 {
                     return Err(Fault::new(
                         503,
                         "unpriced_usage",
-                        format!("请求被拒绝：模型「{actual}」当前周期有 {unpriced} 条用量记录尚未计价。请联系管理员确认补计费用后重试。"),
+                        format!("请求被拒绝：{}当前周期有 {unpriced} 条用量记录尚未计价，无法核算金额额度。请联系管理员编辑对应额度并确认补计费用后重试。",
+                            scope.subject()),
                     ));
                 }
                 totals["cost_micros"].as_i64().unwrap_or(0)
@@ -626,11 +758,21 @@ impl Engine {
                 } else {
                     ("Token", "Token", used.to_string(), limit.to_string())
                 };
+                let subject = format!(
+                    "{}的{label}{}额度",
+                    scope.subject(),
+                    if matches!(scope, Scope::Total) {
+                        "总"
+                    } else {
+                        ""
+                    }
+                );
                 let message = format!(
-                    "请求被拒绝：模型「{actual}」{period}的{label}额度已耗尽（已用 {used_text} {unit}，上限 {limit_text} {unit}）。额度将于 {}（服务器时区：{timezone_label}）重置，请等待重置或联系管理员提高额度。",
+                    "请求被拒绝：{subject}{period}已耗尽（已用 {used_text} {unit}，上限 {limit_text} {unit}）。额度将于 {}（服务器时区：{timezone_label}）重置，请等待重置或联系管理员提高额度。",
                     reset.with_timezone(&timezone).format("%Y-%m-%d %H:%M:%S")
                 );
                 let body = json!({"error":{"code":"quota_exceeded","message":message,
+                    "scope":scope.name(),"channel":actual_channel,"channel_label":channel::label(actual_channel),
                     "model":actual,"unit":quota.unit,"period":policy.period,
                     "used":used_text,"limit":limit_text,"reset_at":reset.to_rfc3339(),
                     "timezone":timezone_label}});
@@ -649,13 +791,19 @@ impl Engine {
                 "请求被拒绝：宿主未提供请求标识，暂时无法记录用量。请联系管理员检查宿主与插件的兼容性。",
             )
         })?;
-        let price = self
-            .price(&actual)?
-            .map(|p| serde_json::to_string(&p))
-            .transpose()?;
-        self.db.execute("INSERT OR IGNORE INTO requests(request_id,model,key_id,requested,trace_id,started,status,price)
-            VALUES(?1,?2,?3,?4,?5,?6,'pending',?7)",
-            params![rid,actual,key,requested,string(req,"TraceID").unwrap_or(""),now.timestamp_millis(),price])?;
+        let price = self.price(&actual)?;
+        let money_required = applicable.iter().any(|(_, q)| q.unit == "money");
+        if money_required && price.is_none() {
+            return Err(Fault::new(
+                503,
+                "unpriced_usage",
+                format!("请求被拒绝：模型「{actual}」尚未设置价格，无法核算金额额度。请联系管理员在「模型价格」中设置价格后重试。"),
+            ));
+        }
+        let price = price.map(|p| serde_json::to_string(&p)).transpose()?;
+        self.db.execute("INSERT OR IGNORE INTO requests(request_id,model,key_id,requested,trace_id,started,status,price,channel)
+            VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8)",
+            params![rid,actual,key,requested,string(req,"TraceID").unwrap_or(""),now.timestamp_millis(),price,actual_channel])?;
         Ok(json!({}))
     }
     pub fn complete(&mut self, req: &Value, now: DateTime<Utc>) -> Result<()> {
@@ -689,39 +837,23 @@ impl Engine {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.timestamp_millis())
             .unwrap_or(now.timestamp_millis());
-        let exact: Option<(String,i64,Option<String>,String)> = self.db.query_row(
-            "SELECT key_id,started,price,request_id FROM requests WHERE request_id=?1 AND model=?2",
-            params![rid,model], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let exact: Option<(String,i64,Option<String>,String,String)> = self.db.query_row(
+            "SELECT key_id,started,price,request_id,channel FROM requests WHERE request_id=?1 AND model=?2",
+            params![rid,model], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
         let pending = match exact {
             Some(value) => Some(value),
             None if !trace.is_empty() && fallback_key.is_some() => self.db.query_row(
-                "SELECT key_id,started,price,request_id FROM requests WHERE trace_id=?1 AND model=?2 AND key_id=?3
+                "SELECT key_id,started,price,request_id,channel FROM requests WHERE trace_id=?1 AND model=?2 AND key_id=?3
                  AND ABS(started-?4)<86400000 ORDER BY started DESC LIMIT 1",
-                params![trace,model,fallback_key,requested_at], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?,
+                params![trace,model,fallback_key,requested_at], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?,
             _ => None,
         };
-        let (key, started, price, parent_id) = match pending {
+        let (key, started, price, parent_id, request_channel) = match pending {
             Some(pending) => pending,
             None => {
-                let Some(key) = fallback_key else {
-                    return Ok(());
-                };
-                let exists: bool = self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM keys WHERE id=?1)",
-                    [&key],
-                    |r| r.get(0),
-                )?;
-                // Usage for requests admitted before plugin installation is not ours to charge.
-                if !exists
-                    || !self
-                        .policy(&key)?
-                        .rules
-                        .get(model)
-                        .is_some_and(|rule| rule.access == "allow" && rule.quota.is_some())
-                {
-                    return Ok(());
-                }
-                (key, requested_at, None, rid.to_string())
+                // Never infer an earlier admission from today's policy. No credentials in diagnostics.
+                eprintln!("cpa-apikey-manager: 忽略无法关联准入记录的用量通知");
+                return Ok(());
             }
         };
         let detail: Detail =
@@ -766,9 +898,9 @@ impl Engine {
             "DELETE FROM usage WHERE request_id=?1 AND model=?2 AND manual=1",
             params![parent_id, model],
         )?;
-        tx.execute("INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,manual)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)", params![id,parent_id,key,model,started,tokens.total,cost,
-                serde_json::to_string(&tokens)?,record["Failed"].as_bool().unwrap_or(false),record["Stream"].as_bool().unwrap_or(false)])?;
+        tx.execute("INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,manual,channel)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11)", params![id,parent_id,key,model,started,tokens.total,cost,
+                serde_json::to_string(&tokens)?,record["Failed"].as_bool().unwrap_or(false),record["Stream"].as_bool().unwrap_or(false),request_channel])?;
         tx.execute(
             "UPDATE requests SET status=?1 WHERE request_id=?2 AND model=?3",
             params![
@@ -806,16 +938,16 @@ impl Engine {
         {
             return Err("Token 明细必须非负且合计一致".into());
         }
-        let row: Option<(String, i64, Option<String>)> = self
+        let row: Option<(String, i64, Option<String>, String)> = self
             .db
             .query_row(
-                "SELECT key_id,started,price FROM requests
+                "SELECT key_id,started,price,channel FROM requests
             WHERE request_id=?1 AND model=?2 AND status='review'",
                 params![rid, model],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let (key, started, price) = row.ok_or("该请求不在待核对状态")?;
+        let (key, started, price, request_channel) = row.ok_or("该请求不在待核对状态")?;
         let price = price
             .map(|p| serde_json::from_str::<Price>(&p))
             .transpose()?
@@ -827,9 +959,9 @@ impl Engine {
             "DELETE FROM usage WHERE request_id=?1 AND model=?2",
             params![rid, model],
         )?;
-        tx.execute("INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,manual)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,0,1)",
-            params![format!("manual:{rid}:{model}"),rid,key,model,started,tokens.total,cost,serde_json::to_string(&tokens)?])?;
+        tx.execute("INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,manual,channel)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,0,1,?9)",
+            params![format!("manual:{rid}:{model}"),rid,key,model,started,tokens.total,cost,serde_json::to_string(&tokens)?,request_channel])?;
         tx.execute(
             "UPDATE requests SET status='settled' WHERE request_id=?1 AND model=?2",
             params![rid, model],
@@ -848,20 +980,33 @@ impl Engine {
         let mut keys = Vec::new();
         let mut stmt = self
             .db
-            .prepare("SELECT id,masked,active,policy FROM keys ORDER BY rowid")?;
+            .prepare("SELECT id,masked,active,policy,recording_since FROM keys ORDER BY rowid")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, bool>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })?;
         for row in rows {
-            let (id, masked, active, p) = row?;
+            let (id, masked, active, p, key_recording_since) = row?;
             let policy = decode_policy(&p)?;
-            let (_, period_end) = accounting::period_bounds(now, zone, &policy.period)?;
+            let (period_start, period_end) = accounting::period_bounds(now, zone, &policy.period)?;
+            let mut total_usage = self.totals(&id, "", period_start, period_end)?;
+            total_usage["reset_at"] = json!(DateTime::from_timestamp_millis(period_end)
+                .unwrap()
+                .with_timezone(&zone)
+                .to_rfc3339());
             let mut quotas = serde_json::Map::new();
+            let mut channel_usage = serde_json::Map::new();
+            for (channel, _) in channel::ALL {
+                let mut totals =
+                    self.scope_totals(&id, Scope::Channel(channel), period_start, period_end)?;
+                totals["reset_at"] = total_usage["reset_at"].clone();
+                channel_usage.insert(channel.into(), totals);
+            }
             for (model, rule) in &policy.rules {
                 if rule.quota.is_some() {
                     let (start, end) = accounting::period_bounds(now, zone, &policy.period)?;
@@ -874,7 +1019,9 @@ impl Engine {
                 }
             }
             keys.push(
-                json!({"id":id,"masked":masked,"active":active,"policy":policy,"quotas":quotas,
+                json!({"id":id,"masked":masked,"active":active,"policy":policy,"quotas":quotas,"total_usage":total_usage,
+                    "channel_usage":channel_usage,"recording_since":key_recording_since,
+                    "partial_period":DateTime::parse_from_rfc3339(&key_recording_since).map(|t| t.timestamp_millis()>period_start).unwrap_or(true),
                     "period_reset_at":DateTime::from_timestamp_millis(period_end).map(|t| t.with_timezone(&zone).to_rfc3339())}),
             );
         }
@@ -905,8 +1052,18 @@ impl Engine {
             let id = row?;
             let price_model = self.canonical(&id);
             let entry = saved_prices.get(&price_model);
+            let model_channel = if self
+                .aliases
+                .get(&id)
+                .is_some_and(|targets| targets.len() > 1)
+            {
+                None
+            } else {
+                Some(channel::classify(&price_model))
+            };
             models.push(json!({
                 "id":id,"price_model":price_model,
+                "channel":model_channel,"channel_label":model_channel.map(channel::label).unwrap_or("多渠道／待解析"),
                 "price":entry.map(|e| &e.0),"revision":entry.map(|e| e.1).unwrap_or(0),
                 "price_source":entry.map(|e| e.2.as_deref().unwrap_or("manual")),
                 "price_source_model":entry.and_then(|e| e.3.as_deref()),
@@ -924,12 +1081,19 @@ impl Engine {
             [],
             |r| r.get(0),
         )?;
+        let continuous_recording_since: String = self.db.query_row(
+            "SELECT value FROM meta WHERE name='continuous_recording_since'",
+            [],
+            |r| r.get(0),
+        )?;
         Ok(
             json!({"version":env!("CARGO_PKG_VERSION"),"timezone":server_timezone_name(),
             "server_offset_seconds":now.with_timezone(&Local).offset().local_minus_utc(),
             "timezone_source":"server","currency":"USD",
             "source_error":self.source_error,"health_error":self.health_error,"recording_since":recording_since,
             "review_count":reviews,"keys":keys,"models":models,
+            "channels":channel::ALL.map(|(id,label)| json!({"id":id,"label":label})),
+            "continuous_recording_since":continuous_recording_since,
             "price_sync":self.price_sync.as_ref().map(|worker| worker.status()),
             "quota_mode":"settled_usage","server_time":now.to_rfc3339()}),
         )
@@ -938,16 +1102,20 @@ impl Engine {
         &mut self,
         key: &str,
         model: &str,
+        channel: &str,
         offset: i64,
         reviews: bool,
         now: DateTime<Utc>,
     ) -> Result<Value> {
+        if !channel.is_empty() && (!model.is_empty() || !channel::valid(channel)) {
+            return Err("核对查询须选择有效渠道或模型，不能同时指定".into());
+        }
         self.expire_pending(now)?;
         let mut items = Vec::new();
         if reviews {
             let mut stmt = self.db.prepare("SELECT request_id,model,key_id,started,status,outcome FROM requests
-                WHERE status='review' AND (?1='' OR key_id=?1) AND (?2='' OR model=?2) ORDER BY started DESC LIMIT 100 OFFSET ?3")?;
-            let rows = stmt.query_map(params![key,model,offset.max(0)], |r| Ok(json!({"request_id":r.get::<_,String>(0)?,
+                WHERE status='review' AND (?1='' OR key_id=?1) AND (?2='' OR model=?2) AND (?4='' OR channel=?4) ORDER BY started DESC LIMIT 100 OFFSET ?3")?;
+            let rows = stmt.query_map(params![key,model,offset.max(0),channel], |r| Ok(json!({"request_id":r.get::<_,String>(0)?,
                 "model":r.get::<_,String>(1)?,"key_id":r.get::<_,String>(2)?,"started":r.get::<_,i64>(3)?,
                 "status":r.get::<_,String>(4)?,"outcome":r.get::<_,Option<String>>(5)?})))?;
             for row in rows {
@@ -955,8 +1123,8 @@ impl Engine {
             }
         } else {
             let mut stmt = self.db.prepare("SELECT request_id,model,key_id,started,tokens,cost,detail,failed,stream,manual FROM usage
-                WHERE (?1='' OR key_id=?1) AND (?2='' OR model=?2) ORDER BY started DESC LIMIT 100 OFFSET ?3")?;
-            let rows = stmt.query_map(params![key, model, offset.max(0)], |r| {
+                WHERE (?1='' OR key_id=?1) AND (?2='' OR model=?2) AND (?4='' OR channel=?4) ORDER BY started DESC LIMIT 100 OFFSET ?3")?;
+            let rows = stmt.query_map(params![key, model, offset.max(0), channel], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -1046,6 +1214,10 @@ pub fn server_timezone_name() -> String {
 fn decode_policy(text: &str) -> Result<Policy> {
     let mut value: Value = serde_json::from_str(text)?;
     let object = value.as_object_mut().ok_or("已保存的密钥规则格式无效")?;
+    if !object.contains_key("total_quota_enabled") {
+        let enabled = object.get("total_quota").is_some_and(|v| !v.is_null());
+        object.insert("total_quota_enabled".into(), json!(enabled));
+    }
     object.remove("default_access");
     let mut legacy_periods = std::collections::BTreeSet::new();
     if let Some(rules) = object.get_mut("rules").and_then(Value::as_object_mut) {

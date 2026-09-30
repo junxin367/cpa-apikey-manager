@@ -99,15 +99,31 @@ fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
     };
     match (method, route) {
         ("GET", "/state") => engine.snapshot(Utc::now()),
-        ("GET", "/reviews") => {
-            engine.ledger(query(req, "key"), query(req, "model"), 0, true, Utc::now())
-        }
-        ("PUT", "/policy") => engine.save_policy(
-            required("key_id")?,
-            serde_json::from_value(data["policy"].clone())?,
-            data["reprice"].as_bool().unwrap_or(false),
+        ("GET", "/reviews") => engine.ledger(
+            query(req, "key"),
+            query(req, "model"),
+            query(req, "channel"),
+            0,
+            true,
             Utc::now(),
         ),
+        ("PUT", "/policy") => {
+            let key = required("key_id")?;
+            let old = serde_json::to_value(engine.policy(key)?)?;
+            let mut policy = data["policy"].clone();
+            let object = policy.as_object_mut().ok_or("密钥规则格式无效")?;
+            for field in ["total_quota_enabled", "rule_mode", "channel_rules"] {
+                if !object.contains_key(field) {
+                    object.insert(field.into(), old[field].clone());
+                }
+            }
+            engine.save_policy(
+                key,
+                serde_json::from_value(policy)?,
+                data["reprice"].as_bool().unwrap_or(false),
+                Utc::now(),
+            )
+        }
         ("PUT", "/price") => engine.save_price(
             required("model")?,
             serde_json::from_value::<Price>(data["price"].clone())?,
