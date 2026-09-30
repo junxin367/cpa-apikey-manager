@@ -88,7 +88,7 @@ select, option { cursor: pointer; }
 input:hover:not(:disabled), select:hover:not(:disabled), textarea:hover:not(:disabled) { border-color: var(--color-border-strong); }
 textarea { resize: vertical; width: 100%; min-height: 80px; padding: var(--space-2); background: var(--color-bg-surface); }
 :focus-visible { outline: 1px solid var(--color-focus); outline-offset: 2px; }
-select:focus-visible { outline: none; border-color: var(--color-focus); }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: none; border-color: var(--color-focus); }
 input[aria-invalid="true"], select[aria-invalid="true"] { border-color: var(--color-danger); }
 input::placeholder, textarea::placeholder { color: var(--color-text-disabled); }
 label { display: grid; gap: var(--space-2); font-size: var(--font-small); color: var(--color-text-secondary); cursor: default; }
@@ -275,7 +275,7 @@ dialog::backdrop { background: var(--color-overlay); }
 .quota-modes input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .quota-modes label:hover { background: var(--color-bg-muted); }
 .quota-modes label.active, .quota-modes label.active:hover { color: var(--color-primary); background: var(--color-primary-soft); border-color: var(--color-primary); }
-.quota-modes label:focus-within { outline: 1px solid var(--color-focus); outline-offset: 2px; }
+.quota-modes label:focus-within { outline: none; border-color: var(--color-focus); }
 .quota-amount-field > div { display: grid; gap: var(--space-2); }
 .quota-amount-field input { width: var(--field-note); }
 .quota-warning { color: var(--color-warning); background: var(--color-warning-soft); border-radius: var(--radius); padding: var(--space-3); font-size: var(--font-small); }
