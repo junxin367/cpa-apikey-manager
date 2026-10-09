@@ -6,6 +6,7 @@ let view = "keys", toastTimer, priceTimer, dialogAction, busy = false;
 let dialogDirty = false, dialogTrigger = null, fieldSequence = 0, savingPolicy = false;
 let priceRowsSignature = "";
 let credentialSource = "";
+let comboboxSequence = 0;
 const credentials = globalThis.CpaCredentials;
 const credentialHost = window.location.host, credentialAgent = navigator.userAgent;
 
@@ -165,6 +166,85 @@ function confirmLeave(action) {
   }, "放弃修改并继续");
 }
 function field(label, input) { return el("label", {}, label, input); }
+function modelCombobox(values) {
+  const sequence = ++comboboxSequence, inputId = `model-combobox-${sequence}`, listId = `${inputId}-list`;
+  const input = el("input", {
+    id: inputId, placeholder: "输入或选择实际模型 ID", maxLength: 256, autocomplete: "off",
+    role: "combobox", "aria-label": "实际模型", "aria-autocomplete": "list", "aria-controls": listId, "aria-expanded": "false",
+  });
+  const menu = el("div", { id: listId, class: "combobox-menu", role: "listbox", hidden: true });
+  const toggle = el("button", { class: "combobox-toggle", type: "button", "aria-label": "显示模型列表", "aria-controls": listId }, el("span", { "aria-hidden": "true" }, "▾"));
+  const root = el("div", { class: "model-combobox" }, input, toggle, menu);
+  const allValues = [...new Set(values)].sort((left, right) => left.localeCompare(right));
+  let options = [], activeIndex = -1;
+  const setActive = (index) => {
+    activeIndex = !options.length || index === -1 ? -1 : (index + options.length) % options.length;
+    options.forEach((option, optionIndex) => {
+      option.classList.toggle("active", optionIndex === activeIndex);
+      option.setAttribute("aria-selected", String(optionIndex === activeIndex));
+    });
+    if (activeIndex >= 0) {
+      input.setAttribute("aria-activedescendant", options[activeIndex].id);
+      options[activeIndex].scrollIntoView?.({ block: "nearest" });
+    } else input.removeAttribute("aria-activedescendant");
+  };
+  const choose = (value) => {
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.focus();
+    close();
+  };
+  const renderOptions = () => {
+    const query = input.value.trim().toLowerCase();
+    const filtered = allValues.filter((value) => value.toLowerCase().includes(query))
+      .sort((left, right) => Number(right.toLowerCase().startsWith(query)) - Number(left.toLowerCase().startsWith(query)) || left.localeCompare(right));
+    const visible = filtered.slice(0, 60);
+    options = visible.map((value, index) => el("button", {
+      id: `${listId}-option-${index}`, class: "combobox-option", type: "button", role: "option", title: value,
+      onmouseenter: () => setActive(index), onclick: () => choose(value),
+    }, value));
+    const status = !filtered.length
+      ? el("div", { class: "combobox-empty" }, query ? "没有匹配模型，可直接使用当前输入。" : "暂无可选择模型，可直接输入模型 ID。")
+      : filtered.length > visible.length
+        ? el("div", { class: "combobox-more" }, `还有 ${filtered.length - visible.length} 个结果，请继续输入筛选。`)
+        : null;
+    menu.replaceChildren(...options, ...(status ? [status] : []));
+    setActive(-1);
+  };
+  const open = () => {
+    renderOptions();
+    menu.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+    toggle.setAttribute("aria-label", "收起模型列表");
+  };
+  const close = () => {
+    menu.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+    toggle.setAttribute("aria-label", "显示模型列表");
+    activeIndex = -1;
+  };
+  input.addEventListener("focus", open);
+  input.addEventListener("click", () => { if (menu.hidden) open(); });
+  input.addEventListener("input", open);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (menu.hidden) open();
+      setActive(activeIndex < 0 ? (event.key === "ArrowDown" ? 0 : options.length - 1) : activeIndex + (event.key === "ArrowDown" ? 1 : -1));
+    } else if (event.key === "Enter" && !menu.hidden && activeIndex >= 0) {
+      event.preventDefault();
+      choose(options[activeIndex].textContent);
+    } else if (event.key === "Escape" && !menu.hidden) {
+      event.preventDefault(); event.stopPropagation(); close();
+    } else if (event.key === "Tab") close();
+  });
+  toggle.onclick = () => {
+    if (menu.hidden) { input.focus(); open(); } else { input.focus(); close(); }
+  };
+  root.addEventListener("focusout", (event) => { if (!root.contains(event.relatedTarget)) close(); });
+  return { root, input, close };
+}
 function numericField(attrs, unit, optional = false) {
   const input = el("input", attrs), message = el("small", { class: "field-error", id: "field-error-" + (++fieldSequence), hidden: true });
   input.dataset.unit = unit; input.dataset.optional = String(optional);
@@ -478,15 +558,12 @@ function addRestriction(initialScope = "channel") {
   const firstNewChannel = snapshot.channels.find((item) => !draft.channel_rules[item.id]) || snapshot.channels[0];
   const channelSelect = select(snapshot.channels.map((item) => [item.id, item.label]), firstNewChannel?.id || "other");
   channelSelect.setAttribute("aria-label", "选择渠道");
-  const modelInput = el("input", { placeholder: "输入或选择实际模型 ID", maxLength: 256 });
-  modelInput.setAttribute("list", "restriction-models");
-  modelInput.setAttribute("aria-label", "实际模型");
-  const modelList = el("datalist", { id: "restriction-models" },
-    snapshot.models.filter((model) => !model.targets?.length).map((model) => el("option", { value: model.id })));
+  const modelPicker = modelCombobox(snapshot.models.filter((model) => !model.targets?.length).map((model) => model.id));
+  const modelInput = modelPicker.input;
   const accessSelect = select([["allow", "允许"], ["deny", "禁止"]], "allow");
   accessSelect.setAttribute("aria-label", "权限");
   const channelField = field("选择渠道", channelSelect);
-  const modelField = field("实际模型", el("div", {}, modelInput, modelList));
+  const modelField = el("div", { class: "field-group" }, el("label", { for: modelInput.id }, "实际模型"), modelPicker.root);
   const accessField = field("权限", accessSelect);
   const amount = numericField({ "aria-label": "额度上限", placeholder: "输入额度上限" }, unit);
   const amountLabel = el("span");
@@ -537,6 +614,7 @@ function addRestriction(initialScope = "channel") {
     amountField.hidden = denied || unit === "none";
     channelField.hidden = scope !== "channel";
     modelField.hidden = scope !== "model";
+    if (scope !== "model") modelPicker.close();
     accessField.hidden = scope === "all";
     modelInput.required = scope === "model";
     [...quotaModes.querySelectorAll("input")].forEach((node) => { node.checked = node.value === unit; node.parentElement.classList.toggle("active", node.checked); });

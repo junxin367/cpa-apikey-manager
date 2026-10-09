@@ -6,7 +6,7 @@
       "name": "API 密钥权限与额度",
       "description": "为 CLIProxyAPI 客户端 API 密钥提供模型与渠道访问控制、自然周期额度、用量记账和价格管理。",
       "author": "junxin367",
-      "version": "0.3.4",
+      "version": "0.3.5",
       "repository": "https://github.com/junxin367/cpa-apikey-manager",
       "homepage": "https://github.com/junxin367/cpa-apikey-manager",
       "license": "MIT",

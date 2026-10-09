@@ -270,6 +270,17 @@ dialog::backdrop { background: var(--color-overlay); }
 #dialog-body .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
 #dialog-body .field-grid input { max-width: 224px; }
 #dialog-body > label input { max-width: var(--field-max); }
+.field-group { display: grid; gap: var(--space-2); }
+.field-group > label { display: block; }
+.model-combobox { position: relative; width: 100%; max-width: var(--field-max); }
+.model-combobox > input { max-width: none; padding-right: 40px; }
+.combobox-toggle { position: absolute; z-index: 1; top: 1px; right: 1px; width: 34px; height: 30px; padding: 0; color: var(--color-text-secondary); border: 0; border-left: 1px solid var(--color-border); border-radius: 0 7px 7px 0; background: var(--color-bg-surface); }
+.combobox-toggle:hover:not(:disabled) { color: var(--color-primary); border-color: var(--color-border); background: var(--color-bg-muted); }
+.combobox-menu { position: absolute; z-index: var(--z-popover); inset: calc(100% + var(--space-1)) 0 auto; max-height: min(240px, 35vh); padding: var(--space-1); overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--color-border-strong); border-radius: var(--radius); background: var(--color-bg-surface); box-shadow: var(--shadow-overlay); }
+.combobox-option { width: 100%; min-height: 34px; height: auto; justify-content: flex-start; padding: var(--space-2); color: var(--color-text-primary); border-color: transparent; font-family: var(--font-mono); font-size: var(--font-small); text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.combobox-option.active, .combobox-option:hover { color: var(--color-primary); border-color: transparent; background: var(--color-primary-soft); }
+.combobox-empty, .combobox-more { padding: var(--space-3) var(--space-2); color: var(--color-text-secondary); font-size: var(--font-small); }
+.combobox-more { border-top: 1px solid var(--color-border); }
 #dialog-error { min-height: 21px; margin-top: var(--space-2); font-size: var(--font-small); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); padding: var(--space-4) var(--space-6); border-top: 1px solid var(--color-border); background: var(--color-bg-muted); }
 #dialog-confirm { min-width: 112px; }
