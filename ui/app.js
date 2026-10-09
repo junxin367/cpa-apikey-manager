@@ -3,7 +3,7 @@ const API = "/v0/management/plugins/cpa-apikey-manager";
 const $ = (id) => document.getElementById(id);
 let token = "", snapshot = null, selected = "", draft = null, dirty = false;
 let view = "keys", toastTimer, priceTimer, dialogAction, busy = false;
-let dialogDirty = false, dialogTrigger = null, fieldSequence = 0, savingPolicy = false;
+let dialogTrigger = null, fieldSequence = 0, savingPolicy = false;
 let priceRowsSignature = "";
 let credentialSource = "";
 let comboboxSequence = 0;
@@ -175,24 +175,18 @@ function disconnectCredential(message = "") {
 function modal(title, contents, action, button = "确认") {
   $("dialog-title").textContent = title; $("dialog-body").replaceChildren(...contents);
   $("dialog-error").textContent = ""; $("dialog-confirm").textContent = button;
-  $("dialog-confirm").disabled = false; dialogAction = action; dialogDirty = false;
+  $("dialog-confirm").disabled = false; dialogAction = action;
   dialogTrigger = document.activeElement;
-  $("dialog-discard").hidden = true; $("dialog-actions").hidden = false;
   document.body.classList.add("modal-open"); $("dialog").showModal();
 }
 function closeDialog() {
   if (busy) return;
-  if (dialogDirty) {
-    $("dialog-discard").hidden = false; $("dialog-actions").hidden = true; $("dialog-continue").focus();
-  } else $("dialog").close();
+  $("dialog").close();
 }
 $("dialog-close").onclick = closeDialog; $("dialog-cancel").onclick = closeDialog;
-$("dialog-body").addEventListener("input", () => { dialogDirty = true; });
 $("dialog").addEventListener("cancel", (event) => { event.preventDefault(); closeDialog(); });
-$("dialog-continue").onclick = () => { $("dialog-discard").hidden = true; $("dialog-actions").hidden = false; $("dialog-body").querySelector("input,textarea")?.focus(); };
-$("dialog-abandon").onclick = () => { dialogDirty = false; $("dialog").close(); };
 $("dialog").addEventListener("close", () => {
-  dialogDirty = false; document.body.classList.remove("modal-open"); document.body.append($("toast"));
+  document.body.classList.remove("modal-open"); document.body.append($("toast"));
   if (dialogTrigger?.isConnected) dialogTrigger.focus({ preventScroll: true });
   else if (dialogTrigger?.dataset.model) [...$("price-rows").querySelectorAll("button")].find((node) => node.dataset.model === dialogTrigger.dataset.model)?.focus({ preventScroll: true });
   else if (dialogTrigger?.dataset.quotaModel) [...$("limit-rows").querySelectorAll("button")].find((node) => node.dataset.quotaModel === dialogTrigger.dataset.quotaModel)?.focus({ preventScroll: true });
@@ -200,10 +194,10 @@ $("dialog").addEventListener("close", () => {
   else if (dialogTrigger?.dataset.quotaTotal) $("limit-rows").querySelector("[data-quota-total]")?.focus({ preventScroll: true });
 });
 $("dialog-form").onsubmit = async (event) => {
-  event.preventDefault(); if (busy || !$("dialog-discard").hidden) return;
+  event.preventDefault(); if (busy) return;
   if (![...$("dialog-body").querySelectorAll("input[data-unit]")].filter((input) => !input.disabled).map(validateNumber).every(Boolean)) return;
   busy = true; const restore = pendingButton($("dialog-confirm"), "处理中…");
-  try { await dialogAction(); dialogDirty = false; $("dialog").close(); }
+  try { await dialogAction(); $("dialog").close(); }
   catch (error) { $("dialog-error").textContent = error.message; }
   finally { busy = false; restore(); }
 };
@@ -620,7 +614,7 @@ function editQuota(model = null, channel = false, enableTotal = false) {
   for (const [value, label] of (total ? [["tokens", "Token"], ["money", "金额 USD"]] : [["none", "不限额"], ["tokens", "Token"], ["money", "金额 USD"]])) {
     modes.append(el("label", {}, el("input", { type: "radio", name: "quota-unit", value, onchange: () => {
       if (unit !== "none") amounts[unit] = amount.input.value;
-      unit = value; amount.input.value = amounts[unit] || ""; dialogDirty = true; update();
+      unit = value; amount.input.value = amounts[unit] || ""; update();
     } }), el("span", {}, label)));
   }
   const consent = el("input", { type: "checkbox" });
@@ -682,13 +676,13 @@ function addRestriction(initialScope = "channel") {
   for (const [value, label] of scopeLabels) {
     scopeModes.append(el("label", {}, el("input", { type: "radio", name: "restriction-scope", value, onchange: () => {
       scope = value;
-      dialogDirty = true; loadSelection();
+      loadSelection();
     } }), el("span", {}, label)));
   }
   for (const [value, label] of [["none", "不限额"], ["tokens", "Token"], ["money", "金额 USD"]]) {
     quotaModes.append(el("label", { "data-quota-option": value }, el("input", { type: "radio", name: "restriction-unit", value, onchange: () => {
       if (unit !== "none") amounts[unit] = amount.input.value;
-      unit = value; amount.input.value = amounts[unit] || ""; dialogDirty = true; update();
+      unit = value; amount.input.value = amounts[unit] || ""; update();
     } }), el("span", {}, label)));
   }
   const target = () => scope === "channel" ? channelSelect.value : modelInput.value.trim();
@@ -969,7 +963,7 @@ $("refresh").onclick = () => confirmLeave(async () => {
   const restore = pendingButton($("refresh"), "刷新中…");
   try { await load(); notify("数据已刷新"); } finally { restore(); }
 });
-window.addEventListener("beforeunload", (event) => { if (dirty || dialogDirty) { event.preventDefault(); event.returnValue = ""; } });
+window.addEventListener("beforeunload", (event) => { if (dirty) { event.preventDefault(); event.returnValue = ""; } });
 
 async function bootstrap() {
   const candidates = [];

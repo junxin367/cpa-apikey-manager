@@ -293,10 +293,6 @@ dialog::backdrop { background: var(--color-overlay); }
 #dialog-error { min-height: 21px; margin-top: var(--space-2); font-size: var(--font-small); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); padding: var(--space-4) var(--space-6); border-top: 1px solid var(--color-border); background: var(--color-bg-muted); }
 #dialog-confirm { min-width: 112px; }
-.discard-confirm { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-4) var(--space-6); border-top: 1px solid var(--color-border); background: var(--color-warning-soft); }
-.discard-confirm p { min-width: 0; flex: 1; color: var(--color-warning); display: flex; align-items: center; gap: var(--space-2); }
-.discard-confirm p .icon { flex: none; }
-.discard-confirm > div { display: flex; flex: none; justify-content: flex-end; gap: var(--space-2); }
 .quota-context { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); background: var(--color-bg-muted); border-radius: var(--radius); padding: var(--space-4); }
 .quota-context > div { display: grid; gap: var(--space-2); }
 .quota-context strong { font-size: var(--font-emphasis); font-weight: var(--weight-medium); }
@@ -369,12 +365,8 @@ dialog::backdrop { background: var(--color-overlay); }
   .price-sync-panel > .badge { margin-left: var(--space-8); }
   .settings-panel { padding: var(--space-4); gap: var(--space-4); }
   .runtime-setting-row { align-items: flex-start; flex-direction: column; }
-  .dialog-header, .dialog-content, .dialog-actions, .discard-confirm { padding: var(--space-4); }
+  .dialog-header, .dialog-content, .dialog-actions { padding: var(--space-4); }
   #dialog-body .field-grid { grid-template-columns: minmax(0, 1fr); }
-}
-@media (max-width: 480px) {
-  .discard-confirm { align-items: stretch; flex-direction: column; gap: var(--space-3); }
-  .discard-confirm > div { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
