@@ -28,7 +28,7 @@
         <button data-view="keys" class="nav-item active" aria-current="page"><span data-icon="key"></span>API 密钥<span id="key-count" class="nav-count">0</span></button>
         <button data-view="prices" class="nav-item"><span data-icon="coins"></span>模型价格</button>
       </nav>
-      <div class="sidebar-bottom"><span class="status-dot"></span><span>独立插件</span><small id="version"></small></div>
+      <div class="sidebar-bottom"><span id="plugin-status-dot" class="status-dot"></span><span id="plugin-status">拦截已启用</span><small id="version"></small></div>
     </aside>
     <main class="workspace">
       <header class="topbar">
@@ -42,7 +42,7 @@
         <div id="keys-content"><div class="stats">
           <div class="stat"><span>有效密钥</span><strong id="stat-keys">0</strong><small>从当前宿主同步</small><span class="stat-icon" data-icon="key"></span></div>
           <div class="stat"><span>可配置模型</span><strong id="stat-models">0</strong><small>支持实际模型与别名</small><span class="stat-icon" data-icon="models"></span></div>
-          <div class="stat"><span>已配置规则</span><strong id="stat-rules">0</strong><small>当前生效的权限与额度规则</small><span class="stat-icon" data-icon="shield"></span></div>
+          <div class="stat"><span>已配置规则</span><strong id="stat-rules">0</strong><small>已保存的权限与额度规则</small><span class="stat-icon" data-icon="shield"></span></div>
         </div>
         <div class="key-layout">
           <section class="panel key-list-panel">

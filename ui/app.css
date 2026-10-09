@@ -137,6 +137,7 @@ button .icon { width: 16px; height: 16px; }
 .sidebar-bottom { display: flex; align-items: center; gap: var(--space-2); margin-top: auto; padding: var(--space-4) var(--space-3) 0; border-top: 1px solid var(--color-border); font-size: var(--font-small); color: var(--color-text-secondary); }
 .sidebar-bottom small { margin-left: auto; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--color-success); flex: none; }
+.status-dot.disabled { background: var(--color-warning); }
 .workspace { margin-left: var(--sidebar-width); min-width: 0; }
 .topbar { min-height: 56px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-3) var(--space-6); background: var(--color-bg-surface); border-bottom: 1px solid var(--color-border); }
 .topbar b { font-size: var(--font-body); font-weight: var(--weight-medium); }
@@ -250,6 +251,7 @@ tbody tr:hover { background: var(--color-bg-muted); }
 .footer { max-width: var(--page-width); margin-inline: auto; padding: 0 var(--space-6) var(--space-6); display: flex; justify-content: space-between; gap: var(--space-4); font-size: var(--font-small); color: var(--color-text-secondary); }
 .banner { padding: var(--space-4); margin: var(--space-6) var(--space-6) 0; border: 1px solid var(--color-border); border-radius: var(--radius); }
 .banner.error { color: var(--color-danger); background: var(--color-danger-soft); }
+.banner.warning { color: var(--color-warning); background: var(--color-warning-soft); }
 .toast { position: fixed; z-index: var(--z-toast); top: var(--space-6); left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: var(--space-2); max-width: min(560px, calc(100% - 32px)); margin: 0; padding: var(--space-3) var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius); background: var(--color-bg-surface); color: var(--color-success); box-shadow: var(--shadow-overlay); font-size: var(--font-body); animation: toast-in var(--duration-overlay) ease-out; }
 .toast.error { color: var(--color-danger); }
 dialog { z-index: var(--z-modal); width: min(560px, calc(100% - 32px)); max-height: calc(100dvh - 48px); padding: 0; color: var(--color-text-primary); background: var(--color-bg-surface); border: 1px solid var(--color-border); border-radius: var(--radius-large); box-shadow: var(--shadow-overlay); overflow: hidden; }

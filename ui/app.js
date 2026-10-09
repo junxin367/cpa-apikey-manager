@@ -162,13 +162,20 @@ async function load(preserve = false) {
 }
 function render() {
   $("version").textContent = "v" + snapshot.version; $("timezone").textContent = "服务器时区：" + snapshot.timezone;
+  const enforcementEnabled = snapshot.enforcement_enabled !== false;
+  $("plugin-status").textContent = enforcementEnabled ? "拦截已启用" : "拦截未启用";
+  $("plugin-status-dot").classList.toggle("disabled", !enforcementEnabled);
   $("key-count").textContent = snapshot.keys.filter((k) => k.active).length;
   $("stat-keys").textContent = $("key-count").textContent;
   $("stat-models").textContent = snapshot.models.filter((model) => !model.targets?.length).length;
   $("stat-rules").textContent = snapshot.keys.reduce((count, key) => count + Object.keys(activeRules(key.policy)).length + (key.policy.total_quota_enabled ? 1 : 0), 0);
   const problem = snapshot.source_error || snapshot.health_error;
-  $("system-error").textContent = problem ? "当前请求受到保护性拦截：" + problem : "";
-  $("system-error").hidden = !problem;
+  const message = !enforcementEnabled
+    ? "权限与额度拦截尚未启用。请在插件配置中开启 enforcement-enabled；开启前，当前请求会直接放行且不记账。"
+    : problem ? "当前请求受到保护性拦截：" + problem : "";
+  $("system-error").className = "banner " + (!enforcementEnabled ? "warning" : "error");
+  $("system-error").textContent = message;
+  $("system-error").hidden = !message;
   $("keys-unavailable").hidden = !snapshot.source_error;
   $("keys-content").hidden = !!snapshot.source_error;
   $("keys-unavailable-reason").textContent = snapshot.source_error || "";
@@ -201,8 +208,10 @@ function renderDetail() {
   $("period-note").textContent = ({ day: "每天 00:00 重置", week: "每周一 00:00 重置", month: "每月 1 日 00:00 重置" })[draft.period] + "，按服务器时区计算。";
   $("save-policy").disabled = savingPolicy || !dirty || !key.active; $("discard").disabled = !dirty;
   $("dirty-state").textContent = dirty ? "有未保存的更改" : "所有更改已保存";
-  $("recording-note").textContent = "持续记账启用于 " + date(key.recording_since) + "；插件停用期间无法补算。" +
-    (key.partial_period ? " 本周期更早时段仅包含已有记录。" : "");
+  $("recording-note").textContent = snapshot.enforcement_enabled === false
+    ? "拦截功能尚未启用；当前请求不会被插件拦截或记账。开启后从首次放行请求开始持续记账。"
+    : "持续记账启用于 " + date(key.recording_since) + "；插件停用期间无法补算。" +
+      (key.partial_period ? " 本周期更早时段仅包含已有记录。" : "");
   $("sync-models").disabled = !key.active;
   $("add-restriction").disabled = !key.active;
   $("empty-add-restriction").disabled = !key.active;

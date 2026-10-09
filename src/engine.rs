@@ -1090,6 +1090,7 @@ impl Engine {
             json!({"version":env!("CARGO_PKG_VERSION"),"timezone":server_timezone_name(),
             "server_offset_seconds":now.with_timezone(&Local).offset().local_minus_utc(),
             "timezone_source":"server","currency":"USD",
+            "enforcement_enabled":self.config.enforcement_enabled,
             "source_error":self.source_error,"health_error":self.health_error,"recording_since":recording_since,
             "review_count":reviews,"keys":keys,"models":models,
             "channels":channel::ALL.map(|(id,label)| json!({"id":id,"label":label})),

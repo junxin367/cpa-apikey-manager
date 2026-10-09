@@ -36,6 +36,7 @@ pub struct PluginApi {
 struct State {
     engine: Option<Engine>,
     error: Option<String>,
+    enforcement_enabled: bool,
 }
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
@@ -107,6 +108,7 @@ unsafe extern "C" fn shutdown() {
         if let Ok(mut state) = lock.lock() {
             state.engine = None;
             state.error = None;
+            state.enforcement_enabled = false;
         }
     }
 }
@@ -141,6 +143,7 @@ fn registration() -> Value {
     json!({"schema_version":6,
         "metadata":{"Name":"API 密钥权限与额度","Version":env!("CARGO_PKG_VERSION"),
         "Author":"cpa-apikey-manager","GitHubRepository":option_env!("CPA_PLUGIN_REPOSITORY").unwrap_or(env!("CARGO_PKG_REPOSITORY")),"ConfigFields":[
+            {"Name":"enforcement-enabled","Type":"boolean","Description":"启用权限、额度拦截与用量记账；默认关闭，完成配置后再开启"},
             {"Name":"cpa-config-path","Type":"string","Description":"可选；默认自动识别宿主 -config 参数或工作目录 config.yaml"},
             {"Name":"cpa-base-url","Type":"string","Description":"宿主地址，用于读取模型目录"},
             {"Name":"data-dir","Type":"string","Description":"SQLite 数据目录"}]},
@@ -168,6 +171,10 @@ fn dispatch(method: &str, data: &Value) -> Value {
                 serde_yaml::from_slice::<Config>(&bytes)
                     .map_err(|_| "插件 YAML 配置无效".to_string())
             });
+        state.enforcement_enabled = config
+            .as_ref()
+            .map(|config| config.enforcement_enabled)
+            .unwrap_or(false);
         let result = config.and_then(|config| {
             let config = config.resolve()?;
             if let Some(engine) = state.engine.as_mut() {
@@ -185,8 +192,12 @@ fn dispatch(method: &str, data: &Value) -> Value {
             Ok(())
         });
         state.error = result.err();
-        // Register even with invalid config: leaving the interceptor active avoids silent bypass.
+        // Keep the plugin registered so the management page remains available.
+        // Runtime callbacks bypass until enforcement is explicitly enabled.
         return ok(registration());
+    }
+    if let Some(response) = bypass_when_disabled(method, state.enforcement_enabled) {
+        return response;
     }
     if let Some(error) = &state.error {
         return failure(method, error);
@@ -217,5 +228,43 @@ fn dispatch(method: &str, data: &Value) -> Value {
         },
         "management.handle" => ok(web::handle(engine, data)),
         _ => json!({"ok":false,"error":{"code":"unknown_method","message":"不支持的宿主调用方法"}}),
+    }
+}
+
+fn bypass_when_disabled(method: &str, enforcement_enabled: bool) -> Option<Value> {
+    if enforcement_enabled {
+        return None;
+    }
+    match method {
+        "request.intercept_before"
+        | "request.intercept_after"
+        | "request.complete"
+        | "usage.handle" => Some(ok(json!({}))),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bypass_when_disabled;
+
+    #[test]
+    fn disabled_enforcement_bypasses_runtime_callbacks() {
+        for method in [
+            "request.intercept_before",
+            "request.intercept_after",
+            "request.complete",
+            "usage.handle",
+        ] {
+            let response = bypass_when_disabled(method, false).expect("callback should bypass");
+            assert_eq!(response["ok"], true);
+            assert_eq!(response["result"], serde_json::json!({}));
+        }
+    }
+
+    #[test]
+    fn enabled_enforcement_uses_normal_runtime_path() {
+        assert!(bypass_when_disabled("request.intercept_before", true).is_none());
+        assert!(bypass_when_disabled("management.handle", false).is_none());
     }
 }
