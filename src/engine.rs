@@ -136,6 +136,16 @@ impl Default for Policy {
     }
 }
 impl Policy {
+    fn active_rules(&self) -> &BTreeMap<String, Rule> {
+        if self.rule_mode == "channel" {
+            &self.channel_rules
+        } else {
+            &self.rules
+        }
+    }
+    fn enforcement_configured(&self) -> bool {
+        self.total_quota_enabled || !self.active_rules().is_empty()
+    }
     fn total(&self) -> Option<&Quota> {
         self.total_quota
             .as_ref()
@@ -146,12 +156,7 @@ impl Policy {
         if let Some(quota) = self.total() {
             quotas.push((Scope::Total, quota));
         }
-        let rules = if self.rule_mode == "channel" {
-            &self.channel_rules
-        } else {
-            &self.rules
-        };
-        for (id, rule) in rules {
+        for (id, rule) in self.active_rules() {
             if rule.access == "allow" {
                 if let Some(quota) = &rule.quota {
                     quotas.push((
@@ -214,6 +219,10 @@ impl Engine {
         });
         db.execute("INSERT OR IGNORE INTO meta VALUES('secret',?1)", [&secret])?;
         db.execute(
+            "INSERT OR IGNORE INTO meta VALUES('enforcement_enabled',?1)",
+            ["false"],
+        )?;
+        db.execute(
             "INSERT OR IGNORE INTO meta VALUES('recording_since',?1)",
             [Utc::now().to_rfc3339()],
         )?;
@@ -259,6 +268,52 @@ impl Engine {
     }
     pub fn timezone(&self) -> Local {
         Local
+    }
+    pub fn enforcement_enabled(&self) -> Result<bool> {
+        let value: String = self.db.query_row(
+            "SELECT value FROM meta WHERE name='enforcement_enabled'",
+            [],
+            |row| row.get(0),
+        )?;
+        match value.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(Fault::new(
+                503,
+                "invalid_setting",
+                "已保存的拦截开关状态无效，请联系管理员检查插件数据库",
+            )),
+        }
+    }
+    pub fn set_enforcement_enabled(&mut self, enabled: bool) -> Result<Value> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "INSERT INTO meta(name,value) VALUES('enforcement_enabled',?1)
+             ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+            [if enabled { "true" } else { "false" }],
+        )?;
+        tx.execute(
+            "INSERT INTO audit(created,action,subject,detail) VALUES(?1,'setting','enforcement_enabled',?2)",
+            params![
+                Utc::now().timestamp_millis(),
+                if enabled { "enabled" } else { "disabled" }
+            ],
+        )?;
+        tx.commit()?;
+        Ok(json!({"enforcement_enabled":enabled}))
+    }
+    pub fn reveal_key(&self, key_id: &str) -> Result<&str> {
+        self.keys
+            .values()
+            .find(|key| key.id == key_id)
+            .map(|key| key.raw.as_str())
+            .ok_or_else(|| {
+                Fault::new(
+                    404,
+                    "key_not_found",
+                    "密钥不存在或已从宿主配置中删除，请刷新页面后重试",
+                )
+            })
     }
     pub fn sync(&mut self) -> Result<()> {
         match self.sync_inner() {
@@ -646,6 +701,11 @@ impl Engine {
     }
     pub fn intercept(&mut self, req: &Value, after: bool, now: DateTime<Utc>) -> Result<Value> {
         self.sync()?;
+        let key = self.caller(req)?;
+        let policy = self.policy(&key)?;
+        if !policy.enforcement_configured() {
+            return Ok(json!({}));
+        }
         if self.health_error.is_some() {
             return Err(Fault::new(
                 503,
@@ -653,7 +713,6 @@ impl Engine {
                 "请求被拒绝：用量记账服务异常，暂时无法核验额度。请联系管理员检查数据库和磁盘状态，修复后重启插件。",
             ));
         }
-        let key = self.caller(req)?;
         let requested = string(req, "RequestedModel")
             .or_else(|| string(req, "Model"))
             .ok_or_else(|| {
@@ -669,7 +728,6 @@ impl Engine {
             .is_some_and(|p| p.ends_with("/count_tokens"))
         {
             // Token counting has no generation cost, but still enforces model permissions.
-            let policy = self.policy(&key)?;
             let targets = self
                 .aliases
                 .get(requested)
@@ -687,7 +745,6 @@ impl Engine {
         } else {
             self.canonical(requested)
         };
-        let policy = self.policy(&key)?;
         if (after || policy.rule_mode == "model") && !Self::permitted(&policy, requested, &actual) {
             return Err(Self::denied(&policy, &actual));
         }
@@ -700,7 +757,8 @@ impl Engine {
         if added == 1 {
             self.schedule_price_sync();
         }
-        // All admitted generations are recorded, independently of active limits.
+        // Once a key has effective policy configuration, record every admitted generation so
+        // later changes to that key's active quotas can use the existing ledger.
         self.expire_pending(now)?;
         let actual_channel = channel::classify(&actual);
         let applicable: Vec<_> = policy
@@ -824,15 +882,22 @@ impl Engine {
         if record.get("Generate") == Some(&Value::Bool(false)) {
             return Ok(());
         }
-        let rid = string(record, "RequestID").ok_or("用量事件缺少 RequestID")?;
-        let model = string(record, "Model").ok_or("用量事件缺少 Model")?;
-        let trace = string(record, "TraceID").unwrap_or("");
         let raw_key = string(record, "APIKey").unwrap_or("");
         let fallback_key = if raw_key.is_empty() {
             None
         } else {
             Some(self.key_id(raw_key))
         };
+        if fallback_key
+            .as_deref()
+            .and_then(|key| self.policy(key).ok())
+            .is_some_and(|policy| !policy.enforcement_configured())
+        {
+            return Ok(());
+        }
+        let rid = string(record, "RequestID").ok_or("用量事件缺少 RequestID")?;
+        let model = string(record, "Model").ok_or("用量事件缺少 Model")?;
+        let trace = string(record, "TraceID").unwrap_or("");
         let requested_at = string(record, "RequestedAt")
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.timestamp_millis())
@@ -1090,7 +1155,7 @@ impl Engine {
             json!({"version":env!("CARGO_PKG_VERSION"),"timezone":server_timezone_name(),
             "server_offset_seconds":now.with_timezone(&Local).offset().local_minus_utc(),
             "timezone_source":"server","currency":"USD",
-            "enforcement_enabled":self.config.enforcement_enabled,
+            "enforcement_enabled":self.enforcement_enabled()?,
             "source_error":self.source_error,"health_error":self.health_error,"recording_since":recording_since,
             "review_count":reviews,"keys":keys,"models":models,
             "channels":channel::ALL.map(|(id,label)| json!({"id":id,"label":label})),
@@ -1258,4 +1323,191 @@ pub fn validate_model(model: &str) -> Result<()> {
         return Err("模型 ID 必须为 1～256 字节，且不含首尾空白或控制字符".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod key_reveal_tests {
+    use super::{Engine, Key, Policy, Quota, Rule};
+    use crate::config::Config;
+    use chrono::Utc;
+    use rusqlite::Connection;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    fn engine_with_key() -> Engine {
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            "caller-scope".into(),
+            Key {
+                id: "key-id".into(),
+                raw: "sk-complete-test-key".into(),
+            },
+        );
+        let db = Connection::open_in_memory().expect("in-memory database");
+        db.execute_batch(
+            "CREATE TABLE meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
+             CREATE TABLE audit(id INTEGER PRIMARY KEY,created INTEGER NOT NULL,action TEXT NOT NULL,subject TEXT NOT NULL,detail TEXT NOT NULL);
+             INSERT INTO meta VALUES('enforcement_enabled','false');",
+        )
+        .expect("test schema");
+        Engine {
+            config: Config::default(),
+            db,
+            secret: Vec::new(),
+            keys,
+            source_hash: String::new(),
+            aliases: BTreeMap::new(),
+            source_error: None,
+            health_error: None,
+            price_sync: None,
+        }
+    }
+
+    #[test]
+    fn reveals_only_a_current_key_by_internal_id() {
+        let engine = engine_with_key();
+        assert_eq!(engine.reveal_key("key-id").unwrap(), "sk-complete-test-key");
+        let error = engine.reveal_key("missing").unwrap_err();
+        assert_eq!(error.status, 404);
+        assert_eq!(error.code, "key_not_found");
+    }
+
+    #[test]
+    fn persists_enforcement_setting() {
+        let mut engine = engine_with_key();
+        assert!(!engine.enforcement_enabled().unwrap());
+        assert_eq!(
+            engine.set_enforcement_enabled(true).unwrap(),
+            serde_json::json!({"enforcement_enabled":true})
+        );
+        assert!(engine.enforcement_enabled().unwrap());
+        let audits: i64 = engine
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM audit WHERE action='setting' AND subject='enforcement_enabled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audits, 1);
+    }
+
+    #[test]
+    fn only_effective_key_configuration_enables_enforcement() {
+        let mut policy = Policy::default();
+        assert!(!policy.enforcement_configured());
+
+        policy.total_quota = Some(Quota {
+            unit: "tokens".into(),
+            limit: "100".into(),
+        });
+        assert!(
+            !policy.enforcement_configured(),
+            "保留但未启用的总额度不应触发拦截"
+        );
+
+        policy.channel_rules.insert(
+            "gpt".into(),
+            Rule {
+                access: "deny".into(),
+                quota: None,
+            },
+        );
+        assert!(
+            !policy.enforcement_configured(),
+            "模型模式下暂停的渠道规则不应触发拦截"
+        );
+
+        policy.rules.insert(
+            "gpt-5".into(),
+            Rule {
+                access: "allow".into(),
+                quota: None,
+            },
+        );
+        assert!(policy.enforcement_configured());
+
+        policy.rules.clear();
+        policy.rule_mode = "channel".into();
+        assert!(policy.enforcement_configured());
+
+        policy.channel_rules.clear();
+        assert!(!policy.enforcement_configured());
+
+        policy.total_quota_enabled = true;
+        assert!(policy.enforcement_configured());
+    }
+
+    #[test]
+    fn intercept_bypasses_unconfigured_key_before_health_and_model_checks() {
+        let config_path =
+            std::env::temp_dir().join(format!("cpa-apikey-manager-{}.yaml", uuid::Uuid::new_v4()));
+        fs::write(
+            &config_path,
+            "access:\n  api-keys:\n    - sk-unconfigured-test\n",
+        )
+        .expect("write source config");
+
+        let mut db = Connection::open_in_memory().expect("in-memory database");
+        crate::migrations::initialize(&mut db).expect("initialize schema");
+        let mut config = Config::default();
+        config.cpa_config_path = config_path.clone();
+        config.price_sync.enabled = false;
+        let mut engine = Engine {
+            config,
+            db,
+            secret: b"test-secret".to_vec(),
+            keys: BTreeMap::new(),
+            source_hash: String::new(),
+            aliases: BTreeMap::new(),
+            source_error: None,
+            health_error: Some("test accounting failure".into()),
+            price_sync: None,
+        };
+        let request = json!({
+            "Metadata": {
+                "caller_scope": crate::config::caller_scope("sk-unconfigured-test")
+            }
+        });
+
+        assert_eq!(
+            engine.intercept(&request, false, Utc::now()).unwrap(),
+            json!({})
+        );
+        let requests: i64 = engine
+            .db
+            .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(requests, 0);
+        engine
+            .usage(&json!({"APIKey":"sk-unconfigured-test"}), Utc::now())
+            .unwrap();
+        let usage: i64 = engine
+            .db
+            .query_row("SELECT COUNT(*) FROM usage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(usage, 0);
+
+        let key_id = engine.keys.values().next().unwrap().id.clone();
+        let mut policy = Policy::default();
+        policy.rules.insert(
+            "gpt-5".into(),
+            Rule {
+                access: "allow".into(),
+                quota: None,
+            },
+        );
+        engine
+            .db
+            .execute(
+                "UPDATE keys SET policy=?1 WHERE id=?2",
+                rusqlite::params![serde_json::to_string(&policy).unwrap(), key_id],
+            )
+            .unwrap();
+        let error = engine.intercept(&request, false, Utc::now()).unwrap_err();
+        assert_eq!(error.code, "accounting_unavailable");
+
+        fs::remove_file(config_path).expect("remove source config");
+    }
 }

@@ -59,9 +59,9 @@
                 <p id="period-note" class="fine period-note"></p>
               </div>
               <section class="limits-section" aria-labelledby="limits-heading">
-                <div class="section-toolbar limits-toolbar"><div><h3 id="limits-heading">限制设置</h3><p class="fine">仅展示已经添加的限制；未添加的范围默认允许且不限额。</p></div><div class="toolbar-actions"><label class="switch-control"><input id="total-quota-enabled" type="checkbox" role="switch"><span>总额度</span></label><button id="sync-models" class="secondary"><span data-icon="refresh"></span>同步模型</button><button id="add-restriction" class="primary"><span data-icon="plus"></span>添加限制</button></div></div>
+                <div class="section-toolbar limits-toolbar"><div><h3 id="limits-heading">限制设置</h3><p class="fine">仅展示已经添加的限制；当前密钥没有生效规则时直接放行且不记账。</p></div><div class="toolbar-actions"><label class="switch-control"><input id="total-quota-enabled" type="checkbox" role="switch"><span>总额度</span></label><button id="sync-models" class="secondary"><span data-icon="refresh"></span>同步模型</button><button id="add-restriction" class="primary"><span data-icon="plus"></span>添加限制</button></div></div>
                 <p id="limit-mode-note" class="limit-mode-note fine"></p>
-                <div id="limits-empty" class="empty compact"><span data-icon="shield"></span><h2>尚未添加限制</h2><p>可以限制全部模型、一个模型渠道，或单个实际模型。</p><button id="empty-add-restriction" class="primary"><span data-icon="plus"></span>添加第一个限制</button></div>
+                <div id="limits-empty" class="empty compact"><span data-icon="shield"></span><h2>尚未添加限制</h2><p>当前密钥直接放行且不记账；可添加全部模型、渠道或单模型限制。</p><button id="empty-add-restriction" class="primary"><span data-icon="plus"></span>添加第一个限制</button></div>
                 <div id="limits-table-wrap" class="table-scroll" tabindex="0" role="region" aria-label="已添加的限制" hidden><table class="limits-table"><thead><tr><th>限制范围</th><th>权限</th><th>额度上限</th><th>本周期已用</th><th>操作</th></tr></thead><tbody id="limit-rows"></tbody></table></div>
                 <p class="notice"><span data-icon="info"></span><span>额度耗尽后阻止新请求；已放行请求会继续结算，可能超出上限。</span></p>
                 <p id="recording-note" class="notice"></p>
@@ -84,22 +84,34 @@
         </div>
       </section>
       <section id="settings-view" class="page" hidden>
-        <div class="page-heading"><div><h1>设置</h1><p class="muted">管理插件页面访问宿主管理接口时使用的凭据。</p></div><span id="credential-status" class="badge warn">尚未连接</span></div>
-        <form id="credential-form" class="panel settings-panel">
-          <div>
-            <h2>管理密钥</h2>
-            <p id="credential-source" class="muted">正在检查宿主管理中心保存的凭据。</p>
-          </div>
-          <label for="settings-management-key">CLIProxyAPI 管理密钥
-            <input id="settings-management-key" type="password" required autocomplete="current-password" placeholder="输入管理密钥">
-          </label>
-          <label class="remember-control"><input id="remember-management-key" type="checkbox" checked><span>保存到当前浏览器，后续自动连接</span></label>
-          <p class="fine">内嵌在官方管理中心且登录时选择“记住密码”后，插件会自动复用宿主凭据。手动保存的密钥只保存在当前浏览器，不写入插件配置或数据库。</p>
-          <p id="credential-error" class="error" role="alert"></p>
-          <div class="settings-actions"><button id="save-credential" class="primary" type="submit">保存并连接</button><button id="clear-credential" class="secondary" type="button">清除本页保存的密钥</button></div>
-        </form>
+        <div class="page-heading"><div><h1>设置</h1><p class="muted">管理拦截运行状态和页面访问宿主管理接口时使用的凭据。</p></div><span id="credential-status" class="badge warn">尚未连接</span></div>
+        <div class="settings-layout">
+          <section class="panel settings-panel runtime-settings">
+            <div>
+              <h2>拦截与记账</h2>
+              <p class="muted">控制插件是否处理请求权限、额度和用量记录。</p>
+            </div>
+            <div class="runtime-setting-row">
+              <div><strong>启用请求拦截</strong><p id="settings-enforcement-detail" class="fine">连接管理接口后可设置。</p></div>
+              <label class="switch-control"><input id="settings-enforcement-enabled" type="checkbox" role="switch" disabled><span id="settings-enforcement-label">未启用</span></label>
+            </div>
+            <p class="fine">关闭时请求直接放行且不记账；已经保存的密钥规则、额度和历史用量都会保留。</p>
+          </section>
+          <form id="credential-form" class="panel settings-panel">
+            <div>
+              <h2>管理密钥</h2>
+              <p id="credential-source" class="muted">正在检查宿主管理中心保存的凭据。</p>
+            </div>
+            <label for="settings-management-key">CLIProxyAPI 管理密钥
+              <input id="settings-management-key" type="password" required autocomplete="current-password" placeholder="输入管理密钥">
+            </label>
+            <label class="remember-control"><input id="remember-management-key" type="checkbox" checked><span>保存到当前浏览器，后续自动连接</span></label>
+            <p class="fine">内嵌在官方管理中心且登录时选择“记住密码”后，插件会自动复用宿主凭据。手动保存的密钥只保存在当前浏览器，不写入插件配置或数据库。</p>
+            <p id="credential-error" class="error" role="alert"></p>
+            <div class="settings-actions"><button id="save-credential" class="primary" type="submit">保存并连接</button><button id="clear-credential" class="secondary" type="button">清除本页保存的密钥</button></div>
+          </form>
+        </div>
       </section>
-      <footer class="footer">CPA · 密钥权限与额度<span>自然周期重置 · 服务器系统时区</span></footer>
     </main>
   </div>
   <dialog id="dialog" aria-labelledby="dialog-title">

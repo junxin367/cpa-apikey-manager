@@ -27,7 +27,7 @@ pub fn response(status: u16, content_type: &str, body: &str) -> Value {
 pub fn registration(req: &Value) -> Value {
     let base = req["BasePath"].as_str().unwrap_or("/v0/management");
     let routes: Vec<_> = [
-        ("GET","state"),("GET","reviews"),("PUT","policy"),("PUT","price"),
+        ("GET","state"),("GET","reviews"),("POST","key"),("PUT","settings"),("PUT","policy"),("PUT","price"),
         ("POST","sync-models"),("POST","sync-prices"),("POST","model"),("POST","settle")
     ].iter().map(|(method,path)|json!({"Method":method,"Path":format!("{base}/plugins/cpa-apikey-manager/{path}")})).collect();
     json!({"routes":routes,"resources":[
@@ -80,7 +80,8 @@ pub fn handle(engine: &mut Engine, req: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{resource, response, RESOURCE};
+    use super::{registration, resource, response, RESOURCE};
+    use serde_json::json;
 
     #[test]
     fn resources_allow_management_embedding() {
@@ -96,6 +97,20 @@ mod tests {
         let value = resource(&format!("{RESOURCE}/credentials.js")).expect("credential resource");
         assert_eq!(value["StatusCode"], 200);
         assert!(!value["Body"].as_str().unwrap_or("").is_empty());
+    }
+
+    #[test]
+    fn registration_includes_authenticated_management_routes() {
+        let value = registration(&json!({"BasePath":"/v0/management"}));
+        let routes = value["routes"].as_array().unwrap();
+        assert!(routes.iter().any(|route| {
+            route["Method"] == "POST"
+                && route["Path"] == "/v0/management/plugins/cpa-apikey-manager/key"
+        }));
+        assert!(routes.iter().any(|route| {
+            route["Method"] == "PUT"
+                && route["Path"] == "/v0/management/plugins/cpa-apikey-manager/settings"
+        }));
     }
 }
 fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
@@ -132,6 +147,12 @@ fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
             0,
             true,
             Utc::now(),
+        ),
+        ("POST", "/key") => Ok(json!({"key":engine.reveal_key(required("key_id")?)?})),
+        ("PUT", "/settings") => engine.set_enforcement_enabled(
+            data["enforcement_enabled"]
+                .as_bool()
+                .ok_or("缺少 enforcement_enabled 布尔值")?,
         ),
         ("PUT", "/policy") => {
             let key = required("key_id")?;

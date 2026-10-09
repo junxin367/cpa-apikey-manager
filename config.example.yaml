@@ -8,8 +8,6 @@ plugins:
     cpa-apikey-manager:
       enabled: true
       priority: 0
-      # 默认关闭。完成密钥来源、数据目录和规则配置后，再开启拦截与用量记账。
-      enforcement-enabled: false
       # 可选：默认自动识别宿主的 -config/--config 参数；未指定参数时读取工作目录 config.yaml。
       # 外部配置存储或其他非标准部署无法自动识别时，再填写实际配置文件绝对路径。
       # cpa-config-path: "C:/CLIProxyAPI/config.yaml"

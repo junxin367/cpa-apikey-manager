@@ -143,7 +143,6 @@ fn registration() -> Value {
     json!({"schema_version":6,
         "metadata":{"Name":"API 密钥权限与额度","Version":env!("CARGO_PKG_VERSION"),
         "Author":"cpa-apikey-manager","GitHubRepository":option_env!("CPA_PLUGIN_REPOSITORY").unwrap_or(env!("CARGO_PKG_REPOSITORY")),"ConfigFields":[
-            {"Name":"enforcement-enabled","Type":"boolean","Description":"启用权限、额度拦截与用量记账；默认关闭，完成配置后再开启"},
             {"Name":"cpa-config-path","Type":"string","Description":"可选；默认自动识别宿主 -config 参数或工作目录 config.yaml"},
             {"Name":"cpa-base-url","Type":"string","Description":"宿主地址，用于读取模型目录"},
             {"Name":"data-dir","Type":"string","Description":"SQLite 数据目录"}]},
@@ -171,10 +170,6 @@ fn dispatch(method: &str, data: &Value) -> Value {
                 serde_yaml::from_slice::<Config>(&bytes)
                     .map_err(|_| "插件 YAML 配置无效".to_string())
             });
-        state.enforcement_enabled = config
-            .as_ref()
-            .map(|config| config.enforcement_enabled)
-            .unwrap_or(false);
         let result = config.and_then(|config| {
             let config = config.resolve()?;
             if let Some(engine) = state.engine.as_mut() {
@@ -192,6 +187,11 @@ fn dispatch(method: &str, data: &Value) -> Value {
             Ok(())
         });
         state.error = result.err();
+        state.enforcement_enabled = state
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.enforcement_enabled().ok())
+            .unwrap_or(false);
         // Keep the plugin registered so the management page remains available.
         // Runtime callbacks bypass until enforcement is explicitly enabled.
         return ok(registration());
@@ -226,7 +226,13 @@ fn dispatch(method: &str, data: &Value) -> Value {
                 failure(method, &error.message)
             }
         },
-        "management.handle" => ok(web::handle(engine, data)),
+        "management.handle" => {
+            let response = web::handle(engine, data);
+            if let Ok(enabled) = engine.enforcement_enabled() {
+                state.enforcement_enabled = enabled;
+            }
+            ok(response)
+        }
         _ => json!({"ok":false,"error":{"code":"unknown_method","message":"不支持的宿主调用方法"}}),
     }
 }
@@ -246,7 +252,7 @@ fn bypass_when_disabled(method: &str, enforcement_enabled: bool) -> Option<Value
 
 #[cfg(test)]
 mod tests {
-    use super::bypass_when_disabled;
+    use super::{bypass_when_disabled, registration};
 
     #[test]
     fn disabled_enforcement_bypasses_runtime_callbacks() {
@@ -266,5 +272,14 @@ mod tests {
     fn enabled_enforcement_uses_normal_runtime_path() {
         assert!(bypass_when_disabled("request.intercept_before", true).is_none());
         assert!(bypass_when_disabled("management.handle", false).is_none());
+    }
+
+    #[test]
+    fn plugin_config_no_longer_exposes_enforcement_switch() {
+        let value = registration();
+        let fields = value["metadata"]["ConfigFields"].as_array().unwrap();
+        assert!(!fields
+            .iter()
+            .any(|field| field["Name"] == "enforcement-enabled"));
     }
 }

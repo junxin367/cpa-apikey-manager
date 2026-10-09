@@ -12,7 +12,6 @@ use std::{
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Config {
-    pub enforcement_enabled: bool,
     pub cpa_config_path: PathBuf,
     pub cpa_base_url: String,
     pub data_dir: PathBuf,
@@ -21,7 +20,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            enforcement_enabled: false,
             cpa_config_path: PathBuf::new(),
             cpa_base_url: "http://127.0.0.1:8317".into(),
             data_dir: "data/cpa-apikey-manager".into(),
@@ -257,16 +255,11 @@ pub fn read_source(config: &Config) -> Result<Source> {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_config_path_from_args, Config};
+    use super::host_config_path_from_args;
     use std::{ffi::OsString, path::Path};
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
-    }
-
-    #[test]
-    fn enforcement_is_disabled_by_default() {
-        assert!(!Config::default().enforcement_enabled);
     }
 
     #[test]

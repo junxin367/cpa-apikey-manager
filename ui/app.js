@@ -7,6 +7,7 @@ let dialogDirty = false, dialogTrigger = null, fieldSequence = 0, savingPolicy =
 let priceRowsSignature = "";
 let credentialSource = "";
 let comboboxSequence = 0;
+let savingEnforcement = false;
 const credentials = globalThis.CpaCredentials;
 const credentialHost = window.location.host, credentialAgent = navigator.userAgent;
 
@@ -23,6 +24,9 @@ function icon(name) {
     close: ["m6 6 12 12", "M18 6 6 18"],
     info: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z", "M12 11v6", "M12 7h.01"],
     check: ["m5 12 4 4L19 6"],
+    eye: ["M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z", "M12 9a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z"],
+    eyeOff: ["m3 3 18 18", "M10.6 10.6a2 2 0 0 0 2.8 2.8", "M9.9 4.2A11 11 0 0 1 12 4c6.5 0 10 8 10 8a18 18 0 0 1-2.1 3.2", "M6.6 6.6C3.7 8.4 2 12 2 12s3.5 8 10 8a10 10 0 0 0 4.1-.9"],
+    copy: ["M8 8h11v11H8Z", "M5 16H4V4h12v1"],
   };
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("class", "icon"); svg.setAttribute("aria-hidden", "true");
@@ -80,6 +84,22 @@ async function api(path, method = "GET", body) {
   return data;
 }
 async function guard(action) { try { await action(); } catch (error) { notify(error.message, true); } }
+async function rawKey(keyId) {
+  const data = await api("/key", "POST", { key_id: keyId });
+  if (typeof data.key !== "string" || !data.key) throw new Error("宿主未返回完整密钥");
+  return data.key;
+}
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(value); return; } catch {}
+  }
+  const textarea = el("textarea", { value, readOnly: true, "aria-hidden": "true" });
+  textarea.style.position = "fixed"; textarea.style.opacity = "0"; textarea.style.pointerEvents = "none";
+  document.body.append(textarea); textarea.select();
+  const copied = document.execCommand?.("copy");
+  textarea.remove();
+  if (!copied) throw new Error("浏览器未允许复制，请先查看完整密钥后手动复制");
+}
 function savedManagementKey() {
   return credentials?.readSavedManagementKey(localStorage, credentialHost, credentialAgent) || "";
 }
@@ -97,6 +117,31 @@ function renderCredentialState(message = "") {
   $("clear-credential").disabled = !savedManagementKey();
   $("refresh").disabled = !connected;
   $("timezone-chip").hidden = !snapshot;
+  renderEnforcementState();
+}
+function renderEnforcementState() {
+  const connected = !!token && !!snapshot;
+  const enabled = connected && snapshot.enforcement_enabled === true;
+  $("plugin-status").textContent = connected ? (enabled ? "拦截已启用" : "拦截未启用") : "状态待连接";
+  $("plugin-status-dot").classList.toggle("disabled", !enabled);
+  const control = $("settings-enforcement-enabled");
+  control.checked = enabled;
+  control.disabled = !connected || savingEnforcement;
+  $("settings-enforcement-label").textContent = enabled ? "已启用" : "未启用";
+  $("settings-enforcement-detail").textContent = !connected
+    ? "连接管理接口后可设置。"
+    : enabled ? "已配置限制的密钥会执行权限、额度与记账；无规则密钥直接放行。" : "当前请求直接放行，不检查权限、不消耗额度。";
+  if (!snapshot) {
+    $("system-error").hidden = true;
+    return;
+  }
+  const problem = snapshot.source_error || snapshot.health_error;
+  const message = !enabled
+    ? "权限与额度拦截尚未启用。可在“设置”中开启；开启前，当前请求会直接放行且不记账。"
+    : problem ? "插件运行状态异常；需要进入处理流程的请求将采用保护性拦截：" + problem : "";
+  $("system-error").className = "banner " + (!enabled ? "warning" : "error");
+  $("system-error").textContent = message;
+  $("system-error").hidden = !message;
 }
 function setView(next) {
   if (next !== "settings" && !token) next = "settings";
@@ -118,9 +163,6 @@ function disconnectCredential(message = "") {
   token = ""; credentialSource = ""; snapshot = null; selected = ""; draft = null; dirty = false;
   clearTimeout(priceTimer);
   $("timezone-chip").hidden = true;
-  $("system-error").hidden = true;
-  $("plugin-status").textContent = "状态待连接";
-  $("plugin-status-dot").classList.add("disabled");
   setView("settings");
   renderCredentialState(message);
 }
@@ -292,20 +334,11 @@ async function load(preserve = false) {
 function render() {
   $("version").textContent = "v" + snapshot.version; $("timezone").textContent = "服务器时区：" + snapshot.timezone;
   $("timezone-chip").hidden = false;
-  const enforcementEnabled = snapshot.enforcement_enabled !== false;
-  $("plugin-status").textContent = enforcementEnabled ? "拦截已启用" : "拦截未启用";
-  $("plugin-status-dot").classList.toggle("disabled", !enforcementEnabled);
+  renderEnforcementState();
   $("key-count").textContent = snapshot.keys.filter((k) => k.active).length;
   $("stat-keys").textContent = $("key-count").textContent;
   $("stat-models").textContent = snapshot.models.filter((model) => !model.targets?.length).length;
   $("stat-rules").textContent = snapshot.keys.reduce((count, key) => count + Object.keys(activeRules(key.policy)).length + (key.policy.total_quota_enabled ? 1 : 0), 0);
-  const problem = snapshot.source_error || snapshot.health_error;
-  const message = !enforcementEnabled
-    ? "权限与额度拦截尚未启用。请在插件配置中开启 enforcement-enabled；开启前，当前请求会直接放行且不记账。"
-    : problem ? "当前请求受到保护性拦截：" + problem : "";
-  $("system-error").className = "banner " + (!enforcementEnabled ? "warning" : "error");
-  $("system-error").textContent = message;
-  $("system-error").hidden = !message;
   $("keys-unavailable").hidden = !snapshot.source_error;
   $("keys-content").hidden = !!snapshot.source_error;
   $("keys-unavailable-reason").textContent = snapshot.source_error || "";
@@ -314,16 +347,57 @@ function render() {
 function renderKeys() {
   const search = $("key-search").value.trim().toLowerCase();
   const keys = snapshot.keys.filter((k) => (k.masked + k.policy.note).toLowerCase().includes(search));
-  $("key-list").replaceChildren(...keys.map((key) => el("button", {
-    class: "key-card" + (key.id === selected ? " selected" : ""),
-    "aria-pressed": key.id === selected,
-    onclick: () => {
+  $("key-list").replaceChildren(...keys.map((key) => {
+    const value = el(key.policy.note ? "small" : "span", { class: "key-mask" }, key.masked);
+    const reveal = el("button", {
+      class: "key-card-action ghost", type: "button", disabled: !key.active, "aria-pressed": "false",
+      "aria-label": `查看 ${key.policy.note || key.masked} 的完整密钥`,
+      onclick: () => guard(async () => {
+        if (reveal.getAttribute("aria-pressed") === "true") {
+          value.textContent = key.masked; value.classList.remove("revealed");
+          reveal.replaceChildren(icon("eye"), "查看"); reveal.setAttribute("aria-pressed", "false");
+          reveal.setAttribute("aria-label", `查看 ${key.policy.note || key.masked} 的完整密钥`);
+          return;
+        }
+        const restore = pendingButton(reveal, "读取中");
+        try {
+          value.textContent = await rawKey(key.id); value.classList.add("revealed");
+          restore(); reveal.replaceChildren(icon("eyeOff"), "隐藏"); reveal.setAttribute("aria-pressed", "true");
+          reveal.setAttribute("aria-label", `隐藏 ${key.policy.note || key.masked} 的完整密钥`);
+        } catch (error) {
+          restore();
+          throw error;
+        }
+      }),
+    }, icon("eye"), "查看");
+    const copy = el("button", {
+      class: "key-card-action ghost", type: "button", disabled: !key.active,
+      "aria-label": `复制 ${key.policy.note || key.masked} 的完整密钥`,
+      onclick: () => guard(async () => {
+        const restore = pendingButton(copy, "复制中");
+        try {
+          await copyText(await rawKey(key.id));
+          notify("完整密钥已复制");
+        } finally { restore(); }
+      }),
+    }, icon("copy"), "复制");
+    const selectKey = el("button", {
+      class: "key-card-select", type: "button",
+      "aria-pressed": key.id === selected,
+      "aria-label": `选择 ${key.policy.note || key.masked}`,
+      onclick: () => {
       if (key.id === selected) return;
       confirmLeave(() => { selected = key.id; draft = structuredClone(key.policy); dirty = false; renderKeys(); renderDetail(); });
-    },
-  }, el("strong", {}, icon("key"), key.policy.note || key.masked),
-  el("small", { class: "key-mask" }, key.policy.note ? key.masked : "未设置备注"),
-  el("span", { class: "key-meta" }, el("small", {}, (key.policy.total_quota_enabled ? "总额度 · " : "") + "按" + modeLabel(key.policy.rule_mode) + " · " + Object.keys(activeRules(key.policy)).length + " 条规则"), el("span", { class: "badge" + (key.active ? "" : " danger") }, key.active ? "有效" : "已删除")))));
+      },
+    }, el("strong", {}, icon("key"), key.policy.note || value),
+    key.policy.note ? value : el("small", {}, "未设置备注"),
+    el("small", {}, (key.policy.total_quota_enabled ? "总额度 · " : "") + "按" + modeLabel(key.policy.rule_mode) + " · " + Object.keys(activeRules(key.policy)).length + " 条规则"));
+    return el("article", { class: "key-card" + (key.id === selected ? " selected" : "") },
+      selectKey,
+      el("div", { class: "key-card-footer" },
+        el("span", { class: "badge" + (key.active ? "" : " danger") }, key.active ? "有效" : "已删除"),
+        el("span", { class: "key-card-actions" }, reveal, copy)));
+  }));
   if (!keys.length) $("key-list").append(el("div", { class: "empty compact" }, el("p", {}, search ? "没有匹配的密钥" : "宿主暂无 API 密钥，请先在宿主中创建。"), search ? el("button", { class: "secondary", onclick: () => { $("key-search").value = ""; renderKeys(); } }, "清除搜索") : null));
 }
 function renderDetail() {
@@ -338,10 +412,13 @@ function renderDetail() {
   $("period-note").textContent = ({ day: "每天 00:00 重置", week: "每周一 00:00 重置", month: "每月 1 日 00:00 重置" })[draft.period] + "，按服务器时区计算。";
   $("save-policy").disabled = savingPolicy || !dirty || !key.active; $("discard").disabled = !dirty;
   $("dirty-state").textContent = dirty ? "有未保存的更改" : "所有更改已保存";
+  const configured = draft.total_quota_enabled || Object.keys(activeRules(draft)).length > 0;
   $("recording-note").textContent = snapshot.enforcement_enabled === false
-    ? "拦截功能尚未启用；当前请求不会被插件拦截或记账。开启后从首次放行请求开始持续记账。"
-    : "持续记账启用于 " + date(key.recording_since) + "；插件停用期间无法补算。" +
-      (key.partial_period ? " 本周期更早时段仅包含已有记录。" : "");
+    ? "拦截功能尚未启用；当前请求不会被插件拦截或记账。"
+    : !configured
+      ? "当前密钥没有生效的限制配置，请求会直接放行且不记账。启用总额度或添加当前模式限制后开始处理。"
+      : "当前密钥已配置限制；获准的生成请求会记账。密钥同步于 " + date(key.recording_since) + "，插件停用期间无法补算。" +
+        (key.partial_period ? " 本周期更早时段仅包含已有记录。" : "");
   $("sync-models").disabled = !key.active;
   $("add-restriction").disabled = !key.active;
   $("empty-add-restriction").disabled = !key.active;
@@ -826,6 +903,22 @@ $("clear-credential").onclick = () => {
   else renderCredentialState();
   notify("已清除本页保存的管理密钥");
 };
+$("settings-enforcement-enabled").onchange = () => guard(async () => {
+  const control = $("settings-enforcement-enabled"), enabled = control.checked;
+  savingEnforcement = true; control.disabled = true;
+  try {
+    const result = await api("/settings", "PUT", { enforcement_enabled: enabled });
+    snapshot.enforcement_enabled = result.enforcement_enabled === true;
+    renderEnforcementState();
+    notify(snapshot.enforcement_enabled ? "请求拦截与记账已启用" : "请求拦截与记账已关闭");
+  } catch (error) {
+    control.checked = !enabled;
+    throw error;
+  } finally {
+    savingEnforcement = false;
+    renderEnforcementState();
+  }
+});
 $("refresh").onclick = () => confirmLeave(async () => {
   if (!token) { setView("settings"); return; }
   const restore = pendingButton($("refresh"), "刷新中…");
