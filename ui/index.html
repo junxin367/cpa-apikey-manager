@@ -5,20 +5,13 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>CPA · 密钥权限与额度</title>
   <link rel="stylesheet" href="app.css">
+  <script defer src="credentials.js"></script>
   <script defer src="app.js"></script>
 </head>
 <body>
-  <div id="login" class="login-wrap">
-    <form id="login-form" class="login-card">
-      <span class="brand-mark" data-icon="shield"></span>
-      <h1>密钥权限与额度</h1>
-      <p class="muted">登录 CLIProxyAPI 插件管理台。</p>
-      <label for="management-key">管理密钥</label>
-      <input id="management-key" type="password" required autocomplete="off" placeholder="输入 CLIProxyAPI 管理密钥">
-      <button class="primary full" type="submit">进入管理台</button>
-      <p id="login-error" class="error" role="alert"></p>
-      <p class="fine">管理密钥仅保存在当前页面内存中，刷新后需重新登录。</p>
-    </form>
+  <div id="boot" class="boot-wrap">
+    <span class="brand-mark" data-icon="shield"></span>
+    <p>正在连接插件管理台…</p>
   </div>
   <div id="app" class="app-shell" hidden>
     <aside class="sidebar">
@@ -27,13 +20,14 @@
       <nav aria-label="主导航">
         <button data-view="keys" class="nav-item active" aria-current="page"><span data-icon="key"></span>API 密钥<span id="key-count" class="nav-count">0</span></button>
         <button data-view="prices" class="nav-item"><span data-icon="coins"></span>模型价格</button>
+        <button data-view="settings" class="nav-item"><span data-icon="settings"></span>设置</button>
       </nav>
-      <div class="sidebar-bottom"><span id="plugin-status-dot" class="status-dot"></span><span id="plugin-status">拦截已启用</span><small id="version"></small></div>
+      <div class="sidebar-bottom"><span id="plugin-status-dot" class="status-dot disabled"></span><span id="plugin-status">状态待连接</span><small id="version"></small></div>
     </aside>
     <main class="workspace">
       <header class="topbar">
         <b id="breadcrumb">API 密钥</b>
-        <div class="top-actions"><span class="tz-chip"><span data-icon="clock"></span><span id="timezone"></span></span><button id="refresh" class="ghost"><span data-icon="refresh"></span>刷新数据</button><button id="logout" class="ghost"><span data-icon="logout"></span>退出</button></div>
+        <div class="top-actions"><span id="timezone-chip" class="tz-chip" hidden><span data-icon="clock"></span><span id="timezone"></span></span><button id="refresh" class="ghost"><span data-icon="refresh"></span>刷新数据</button></div>
       </header>
       <div id="system-error" class="banner error" role="alert" hidden></div>
       <section id="keys-view" class="page">
@@ -83,6 +77,22 @@
           <div class="table-scroll" tabindex="0" role="region" aria-label="模型价格表格"><table class="price-table"><thead><tr><th>模型 ID</th><th>输入</th><th>输出</th><th>缓存读取</th><th>缓存写入</th><th>价格来源</th><th>操作</th></tr></thead><tbody id="price-rows"></tbody></table></div>
           <p class="price-help">按 models.dev → LiteLLM → OpenRouter 的顺序补全基础文本 Token 价格。缓存价留空时沿用输入价；阶梯、优先级和非 Token 收费需自行核对。</p>
         </div>
+      </section>
+      <section id="settings-view" class="page" hidden>
+        <div class="page-heading"><div><h1>设置</h1><p class="muted">管理插件页面访问宿主管理接口时使用的凭据。</p></div><span id="credential-status" class="badge warn">尚未连接</span></div>
+        <form id="credential-form" class="panel settings-panel">
+          <div>
+            <h2>管理密钥</h2>
+            <p id="credential-source" class="muted">正在检查宿主管理中心保存的凭据。</p>
+          </div>
+          <label for="settings-management-key">CLIProxyAPI 管理密钥
+            <input id="settings-management-key" type="password" required autocomplete="current-password" placeholder="输入管理密钥">
+          </label>
+          <label class="remember-control"><input id="remember-management-key" type="checkbox" checked><span>保存到当前浏览器，后续自动连接</span></label>
+          <p class="fine">内嵌在官方管理中心且登录时选择“记住密码”后，插件会自动复用宿主凭据。手动保存的密钥只保存在当前浏览器，不写入插件配置或数据库。</p>
+          <p id="credential-error" class="error" role="alert"></p>
+          <div class="settings-actions"><button id="save-credential" class="primary" type="submit">保存并连接</button><button id="clear-credential" class="secondary" type="button">清除本页保存的密钥</button></div>
+        </form>
       </section>
       <footer class="footer">CPA · 密钥权限与额度<span>自然周期重置 · 服务器系统时区</span></footer>
     </main>

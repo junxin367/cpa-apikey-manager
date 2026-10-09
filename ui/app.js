@@ -5,6 +5,9 @@ let token = "", snapshot = null, selected = "", draft = null, dirty = false;
 let view = "keys", toastTimer, priceTimer, dialogAction, busy = false;
 let dialogDirty = false, dialogTrigger = null, fieldSequence = 0, savingPolicy = false;
 let priceRowsSignature = "";
+let credentialSource = "";
+const credentials = globalThis.CpaCredentials;
+const credentialHost = window.location.host, credentialAgent = navigator.userAgent;
 
 function icon(name) {
   const paths = {
@@ -14,7 +17,7 @@ function icon(name) {
     models: ["M3 3h7v7H3Z", "M14 3h7v7h-7Z", "M3 14h7v7H3Z", "M14 14h7v7h-7Z"],
     clock: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z", "M12 7v5l3 2"],
     refresh: ["M20 7v5h-5", "M4 17v-5h5", "M6 7a7 7 0 0 1 12-1l2 6", "M18 17a7 7 0 0 1-12 1l-2-6"],
-    logout: ["M10 4H4v16h6", "M9 12h12", "m17 8 4 4-4 4"],
+    settings: ["M4 21v-7", "M4 10V3", "M12 21v-9", "M12 8V3", "M20 21v-5", "M20 12V3", "M1 14h6", "M9 8h6", "M17 16h6"],
     plus: ["M12 5v14", "M5 12h14"],
     close: ["m6 6 12 12", "M18 6 6 18"],
     info: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z", "M12 11v6", "M12 7h.01"],
@@ -62,18 +65,62 @@ function notify(message, error = false) {
 async function api(path, method = "GET", body) {
   const response = await fetch(API + path, {
     method, credentials: "omit", cache: "no-store",
-    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+    headers: { ...(token ? { Authorization: "Bearer " + token } : {}), "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(20000),
   });
   let data;
   try { data = await response.json(); } catch { throw new Error("宿主返回了无效响应，请检查插件状态"); }
   if (!response.ok) {
     const error = new Error(data.error?.message || (response.status === 401 ? "管理密钥无效" : "请求失败：" + response.status));
-    error.code = data.error?.code; throw error;
+    error.code = data.error?.code; error.status = response.status;
+    if (response.status === 401) disconnectCredential(error.message);
+    throw error;
   }
   return data;
 }
 async function guard(action) { try { await action(); } catch (error) { notify(error.message, true); } }
+function savedManagementKey() {
+  return credentials?.readSavedManagementKey(localStorage, credentialHost, credentialAgent) || "";
+}
+function renderCredentialState(message = "") {
+  const connected = !!token;
+  const labels = {
+    host: "已自动复用宿主管理中心保存的管理密钥。",
+    saved: "已使用本页保存在当前浏览器中的管理密钥。",
+    temporary: "已使用当前页面的临时管理密钥，刷新后需要重新设置。",
+  };
+  $("credential-status").textContent = connected ? "已连接" : "需要管理密钥";
+  $("credential-status").className = "badge" + (connected ? "" : " warn");
+  $("credential-source").textContent = connected ? labels[credentialSource] : "未找到可用凭据，请在下方保存管理密钥。";
+  $("credential-error").textContent = message;
+  $("clear-credential").disabled = !savedManagementKey();
+  $("refresh").disabled = !connected;
+  $("timezone-chip").hidden = !snapshot;
+}
+function setView(next) {
+  if (next !== "settings" && !token) next = "settings";
+  view = next;
+  if (snapshot && chosen()) draft = structuredClone(chosen().policy);
+  document.querySelectorAll("[data-view]").forEach((node) => {
+    node.classList.toggle("active", node.dataset.view === view);
+    if (node.dataset.view === view) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current");
+  });
+  for (const name of ["keys", "prices", "settings"]) $(name + "-view").hidden = name !== view;
+  $("breadcrumb").textContent = ({ keys: "API 密钥", prices: "模型价格", settings: "设置" })[view];
+  schedulePriceRefresh();
+  if (view === "keys" && snapshot) renderDetail();
+  if (view === "settings") renderCredentialState();
+}
+function disconnectCredential(message = "") {
+  token = ""; credentialSource = ""; snapshot = null; selected = ""; draft = null; dirty = false;
+  clearTimeout(priceTimer);
+  $("timezone-chip").hidden = true;
+  $("system-error").hidden = true;
+  $("plugin-status").textContent = "状态待连接";
+  $("plugin-status-dot").classList.add("disabled");
+  setView("settings");
+  renderCredentialState(message);
+}
 function modal(title, contents, action, button = "确认") {
   $("dialog-title").textContent = title; $("dialog-body").replaceChildren(...contents);
   $("dialog-error").textContent = ""; $("dialog-confirm").textContent = button;
@@ -162,6 +209,7 @@ async function load(preserve = false) {
 }
 function render() {
   $("version").textContent = "v" + snapshot.version; $("timezone").textContent = "服务器时区：" + snapshot.timezone;
+  $("timezone-chip").hidden = false;
   const enforcementEnabled = snapshot.enforcement_enabled !== false;
   $("plugin-status").textContent = enforcementEnabled ? "拦截已启用" : "拦截未启用";
   $("plugin-status-dot").classList.toggle("disabled", !enforcementEnabled);
@@ -665,30 +713,76 @@ function settle(item, count) {
     await load(true); notify("已核对该请求");
   }, "确认用量并恢复");
 }
-document.querySelectorAll("[data-view]").forEach((button) => button.onclick = () => confirmLeave(async () => {
-  view = button.dataset.view;
-  if (chosen()) draft = structuredClone(chosen().policy);
-  document.querySelectorAll("[data-view]").forEach((node) => { node.classList.toggle("active", node === button); if (node === button) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current"); });
-  for (const name of ["keys", "prices"]) $(name + "-view").hidden = name !== view;
-  $("breadcrumb").textContent = ({ keys: "API 密钥", prices: "模型价格" })[view];
-  schedulePriceRefresh();
-  if (view === "keys") renderDetail();
-}));
-$("login-form").onsubmit = async (event) => {
-  event.preventDefault(); $("login-error").textContent = "";
-  const button = $("login-form").querySelector("button"), restore = pendingButton(button, "正在连接…");
-  token = $("management-key").value.trim();
-  try { await load(); $("management-key").value = ""; $("login").hidden = true; $("app").hidden = false; }
-  catch (error) { token = ""; $("login-error").textContent = error.message; }
-  finally { restore(); }
+document.querySelectorAll("[data-view]").forEach((button) => button.onclick = () => confirmLeave(() => setView(button.dataset.view)));
+$("credential-form").onsubmit = async (event) => {
+  event.preventDefault(); $("credential-error").textContent = "";
+  const managementKey = $("settings-management-key").value.trim();
+  if (!managementKey) { $("credential-error").textContent = "请输入管理密钥"; return; }
+  const remember = $("remember-management-key").checked;
+  const restore = pendingButton($("save-credential"), "正在连接…");
+  token = managementKey; credentialSource = remember ? "saved" : "temporary";
+  try {
+    await load();
+    let storageMessage = "";
+    try {
+      if (remember) credentials.saveManagementKey(localStorage, managementKey, credentialHost, credentialAgent);
+      else credentials.clearManagementKey(localStorage);
+    } catch {
+      credentialSource = "temporary";
+      storageMessage = "已连接，但浏览器未允许保存管理密钥，本次仅在当前页面有效。";
+    }
+    $("settings-management-key").value = "";
+    renderCredentialState(storageMessage);
+    setView("keys");
+    notify(storageMessage || "管理密钥已验证并连接");
+  } catch (error) {
+    if (error.status !== 401) renderCredentialState(error.message);
+  } finally { restore(); }
+};
+$("clear-credential").onclick = () => {
+  try { credentials?.clearManagementKey(localStorage); }
+  catch { $("credential-error").textContent = "浏览器未允许清除本地凭据"; return; }
+  if (credentialSource === "saved") disconnectCredential("本页保存的管理密钥已清除。");
+  else renderCredentialState();
+  notify("已清除本页保存的管理密钥");
 };
 $("refresh").onclick = () => confirmLeave(async () => {
+  if (!token) { setView("settings"); return; }
   const restore = pendingButton($("refresh"), "刷新中…");
   try { await load(); notify("数据已刷新"); } finally { restore(); }
 });
-$("logout").onclick = () => confirmLeave(() => {
-  token = ""; snapshot = null; draft = null; selected = ""; dirty = false;
-  clearTimeout(priceTimer);
-  $("app").hidden = true; $("login").hidden = false; $("login-error").textContent = "";
-});
 window.addEventListener("beforeunload", (event) => { if (dirty || dialogDirty) { event.preventDefault(); event.returnValue = ""; } });
+
+async function bootstrap() {
+  const candidates = [];
+  try {
+    const hostKey = credentials?.readHostManagementKey(localStorage, credentialHost, credentialAgent) || "";
+    const savedKey = savedManagementKey();
+    if (hostKey) candidates.push(["host", hostKey]);
+    if (savedKey && savedKey !== hostKey) candidates.push(["saved", savedKey]);
+  } catch {
+    // Browsers may block storage for cross-origin iframes. The settings page remains available.
+  }
+  let connected = false, message = "";
+  for (const [source, managementKey] of candidates) {
+    token = managementKey; credentialSource = source;
+    try {
+      await load();
+      connected = true;
+      break;
+    } catch (error) {
+      message = error.message;
+      if (error.status !== 401) break;
+    }
+  }
+  $("boot").hidden = true; $("app").hidden = false;
+  if (connected) {
+    renderCredentialState();
+    setView("keys");
+  } else {
+    if (!token) credentialSource = "";
+    setView("settings");
+    renderCredentialState(message);
+  }
+}
+bootstrap();

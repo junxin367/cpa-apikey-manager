@@ -32,7 +32,7 @@ pub fn registration(req: &Value) -> Value {
     ].iter().map(|(method,path)|json!({"Method":method,"Path":format!("{base}/plugins/cpa-apikey-manager/{path}")})).collect();
     json!({"routes":routes,"resources":[
         {"Path":"/index.html","Menu":"密钥权限与额度","Description":"按 API 密钥管理模型权限、Token 与金额额度"},
-        {"Path":"/app.css"},{"Path":"/app.js"}
+        {"Path":"/app.css"},{"Path":"/credentials.js"},{"Path":"/app.js"}
     ]})
 }
 pub fn resource(path: &str) -> Option<Value> {
@@ -46,6 +46,11 @@ pub fn resource(path: &str) -> Option<Value> {
             200,
             "text/css; charset=utf-8",
             include_str!("../ui/app.css"),
+        )),
+        "/credentials.js" => Some(response(
+            200,
+            "text/javascript; charset=utf-8",
+            include_str!("../ui/credentials.js"),
         )),
         "/app.js" => Some(response(
             200,
@@ -75,7 +80,7 @@ pub fn handle(engine: &mut Engine, req: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::response;
+    use super::{resource, response, RESOURCE};
 
     #[test]
     fn resources_allow_management_embedding() {
@@ -84,6 +89,13 @@ mod tests {
             .as_str()
             .unwrap_or("");
         assert!(!policy.contains("frame-ancestors"));
+    }
+
+    #[test]
+    fn resources_include_credential_bridge() {
+        let value = resource(&format!("{RESOURCE}/credentials.js")).expect("credential resource");
+        assert_eq!(value["StatusCode"], 200);
+        assert!(!value["Body"].as_str().unwrap_or("").is_empty());
     }
 }
 fn action(engine: &mut Engine, req: &Value) -> Result<Value> {

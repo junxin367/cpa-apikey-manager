@@ -58,6 +58,8 @@ jobs:
       - name: JavaScript 与注册表
         run: |
           node --check ui/app.js
+          node --check ui/credentials.js
+          node --test ui/credentials.test.mjs
           node --check scripts/release.mjs
           node scripts/release.mjs registry
       - name: 编译与测试
