@@ -100,13 +100,15 @@ function renderCredentialState(message = "") {
 function setView(next) {
   if (next !== "settings" && !token) next = "settings";
   view = next;
+  const viewName = ({ keys: "API 密钥", prices: "模型价格", settings: "设置" })[view];
   if (snapshot && chosen()) draft = structuredClone(chosen().policy);
   document.querySelectorAll("[data-view]").forEach((node) => {
     node.classList.toggle("active", node.dataset.view === view);
     if (node.dataset.view === view) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current");
   });
   for (const name of ["keys", "prices", "settings"]) $(name + "-view").hidden = name !== view;
-  $("breadcrumb").textContent = ({ keys: "API 密钥", prices: "模型价格", settings: "设置" })[view];
+  $("breadcrumb").textContent = viewName;
+  document.title = `${viewName} · CPA 密钥权限与额度`;
   schedulePriceRefresh();
   if (view === "keys" && snapshot) renderDetail();
   if (view === "settings") renderCredentialState();

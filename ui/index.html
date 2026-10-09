@@ -14,21 +14,26 @@
     <p>正在连接插件管理台…</p>
   </div>
   <div id="app" class="app-shell" hidden>
-    <aside class="sidebar">
-      <a class="brand" href="index.html"><span class="brand-mark" data-icon="shield"></span><span>CPA 管理台<small>密钥权限与额度</small></span></a>
-      <p class="nav-label">访问管理</p>
-      <nav aria-label="主导航">
-        <button data-view="keys" class="nav-item active" aria-current="page"><span data-icon="key"></span>API 密钥<span id="key-count" class="nav-count">0</span></button>
-        <button data-view="prices" class="nav-item"><span data-icon="coins"></span>模型价格</button>
-        <button data-view="settings" class="nav-item"><span data-icon="settings"></span>设置</button>
-      </nav>
-      <div class="sidebar-bottom"><span id="plugin-status-dot" class="status-dot disabled"></span><span id="plugin-status">状态待连接</span><small id="version"></small></div>
-    </aside>
+    <header class="plugin-header">
+      <div class="plugin-header-inner">
+        <a class="plugin-brand" href="index.html">
+          <span class="brand-mark" data-icon="shield"></span>
+          <span><strong>密钥权限与额度</strong><small><span>插件管理</span><span class="breadcrumb-separator">/</span><b id="breadcrumb">API 密钥</b></small></span>
+        </a>
+        <nav class="plugin-nav" aria-label="插件页面导航">
+          <button data-view="keys" class="nav-item active" aria-current="page"><span data-icon="key"></span>API 密钥<span id="key-count" class="nav-count">0</span></button>
+          <button data-view="prices" class="nav-item"><span data-icon="coins"></span>模型价格</button>
+          <button data-view="settings" class="nav-item"><span data-icon="settings"></span>设置</button>
+        </nav>
+        <div class="plugin-actions">
+          <span class="status-chip"><span id="plugin-status-dot" class="status-dot disabled"></span><span id="plugin-status">状态待连接</span></span>
+          <small id="version" class="version-label"></small>
+          <span id="timezone-chip" class="tz-chip" hidden><span data-icon="clock"></span><span id="timezone"></span></span>
+          <button id="refresh" class="ghost"><span data-icon="refresh"></span>刷新数据</button>
+        </div>
+      </div>
+    </header>
     <main class="workspace">
-      <header class="topbar">
-        <b id="breadcrumb">API 密钥</b>
-        <div class="top-actions"><span id="timezone-chip" class="tz-chip" hidden><span data-icon="clock"></span><span id="timezone"></span></span><button id="refresh" class="ghost"><span data-icon="refresh"></span>刷新数据</button></div>
-      </header>
       <div id="system-error" class="banner error" role="alert" hidden></div>
       <section id="keys-view" class="page">
         <div class="page-heading"><div><h1>API 密钥</h1><p class="muted">选择密钥，按需添加全部模型、渠道或单模型限制。每把密钥独立设置重置周期。</p></div><span class="outline-tag"><span data-icon="shield"></span>从宿主只读同步</span></div>
