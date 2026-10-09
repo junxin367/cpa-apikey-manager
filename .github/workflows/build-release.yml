@@ -65,10 +65,11 @@ jobs:
           key: check-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
       - name: Rust 格式
         run: cargo fmt --check
-      - name: JavaScript 语法
+      - name: JavaScript 与注册表
         run: |
           node --check ui/app.js
           node --check scripts/release.mjs
+          node scripts/release.mjs registry
       - name: 编译与测试
         run: cargo test --locked
 
@@ -80,18 +81,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: windows-x64
+          - platform: windows-amd64
             runner: windows-latest
-            extension: dll
-          - platform: linux-x64
+            goos: windows
+            goarch: amd64
+          - platform: linux-amd64
             runner: ubuntu-22.04
-            extension: so
-          - platform: macos-x64
+            goos: linux
+            goarch: amd64
+          - platform: darwin-amd64
             runner: macos-15-intel
-            extension: dylib
-          - platform: macos-arm64
+            goos: darwin
+            goarch: amd64
+          - platform: darwin-arm64
             runner: macos-14
-            extension: dylib
+            goos: darwin
+            goarch: arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -112,9 +117,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cpa-apikey-manager-${{ matrix.platform }}
-          path: |
-            dist/cpa-apikey-manager-${{ needs.metadata.outputs.version }}-${{ matrix.platform }}.zip
-            dist/cpa-apikey-manager-${{ needs.metadata.outputs.version }}-${{ matrix.platform }}.${{ matrix.extension }}
+          path: dist/cpa-apikey-manager_${{ needs.metadata.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip
           if-no-files-found: error
           retention-days: 14
 

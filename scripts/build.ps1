@@ -23,16 +23,24 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed: $LASTEXITCODE" }
 
     $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    $goArchitecture = switch ($architecture) {
+        'x64' { 'amd64' }
+        'arm64' { 'arm64' }
+        default { $architecture }
+    }
     if ($IsWindows) {
         $platform = "windows-$architecture"
+        $goOS = 'windows'
         $library = 'cpa_apikey_manager.dll'
         $installedName = 'cpa-apikey-manager.dll'
     } elseif ($IsMacOS) {
         $platform = "macos-$architecture"
+        $goOS = 'darwin'
         $library = 'libcpa_apikey_manager.dylib'
         $installedName = 'cpa-apikey-manager.dylib'
     } else {
         $platform = "linux-$architecture"
+        $goOS = 'linux'
         $library = 'libcpa_apikey_manager.so'
         $installedName = 'cpa-apikey-manager.so'
     }
@@ -51,13 +59,9 @@ try {
     Copy-Item -LiteralPath (Join-Path $projectRoot 'docs/images/prices.jpg') -Destination $packageImagesPath -Force
     $hash = Get-FileHash -LiteralPath (Join-Path $packagePath $installedName) -Algorithm SHA256
     "$($hash.Hash.ToLowerInvariant())  $installedName" | Set-Content -LiteralPath (Join-Path $packagePath 'SHA256SUMS.txt') -Encoding utf8NoBOM
-    $assetName = if ($ReleaseAssets) { "cpa-apikey-manager-$version-$platform" } else { "cpa-apikey-manager-$platform" }
+    $assetName = if ($ReleaseAssets) { "cpa-apikey-manager_{0}_{1}_{2}" -f $version, $goOS, $goArchitecture } else { "cpa-apikey-manager-$platform" }
     $archivePath = Join-Path $projectRoot "dist/$assetName.zip"
     Compress-Archive -Path (Join-Path $packagePath '*') -DestinationPath $archivePath -Force
-    if ($ReleaseAssets) {
-        $extension = [System.IO.Path]::GetExtension($installedName)
-        Copy-Item -LiteralPath (Join-Path $packagePath $installedName) -Destination (Join-Path $projectRoot "dist/$assetName$extension") -Force
-    }
     Write-Output "安装包已生成：$archivePath"
 } finally {
     Pop-Location

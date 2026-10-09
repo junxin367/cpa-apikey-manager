@@ -4,7 +4,7 @@
 
 CLIProxyAPI 原生插件：读取宿主已创建的 API 密钥，独立开关全部模型共享的总额度，并选择按渠道或按模型配置权限与额度。额度支持 Token 或金额，自带独立中文管理页面。
 
-[下载发布产物](https://github.com/junxin367/cpa-apikey-manager/releases/latest) · [查看自动构建](https://github.com/junxin367/cpa-apikey-manager/actions)
+[下载发布产物](https://github.com/junxin367/cpa-apikey-manager/releases/latest) · [插件注册表](https://raw.githubusercontent.com/junxin367/cpa-apikey-manager/main/registry.json) · [查看自动构建](https://github.com/junxin367/cpa-apikey-manager/actions)
 
 ## 功能
 
@@ -41,7 +41,7 @@ CLIProxyAPI 原生插件：读取宿主已创建的 API 密钥，独立开关全
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/junxin367/cpa-apikey-manager/releases/latest) 下载对应平台的 ZIP，解压后安装。ZIP 内动态库已使用正确的插件文件名；独立下载的带版本动态库需要手动重命名。使用 Release 的 `checksums.txt` 校验下载文件，ZIP 内 `SHA256SUMS.txt` 校验安装用动态库。
+可以将本仓库的 [registry.json](https://raw.githubusercontent.com/junxin367/cpa-apikey-manager/main/registry.json) 添加到 CPA 的插件商店注册表，也可以从 [GitHub Releases](https://github.com/junxin367/cpa-apikey-manager/releases/latest) 手动下载对应平台的 ZIP。ZIP 内动态库已使用正确的插件文件名。使用 Release 的 `checksums.txt` 校验下载文件，ZIP 内 `SHA256SUMS.txt` 校验安装用动态库。
 
 1. 将对应平台的动态库放到宿主 `plugins` 目录，文件名必须是：
 
@@ -209,7 +209,7 @@ pwsh -File scripts/build.ps1
 
 脚本生成 `dist/cpa-apikey-manager-windows-x64.zip`，其中包含动态库、配置示例、本文档、MIT 许可证、验证记录、页面截图和 SHA-256 校验文件。实际平台名称随运行系统变化。
 
-加上 `-ReleaseAssets` 会生成包含版本和平台的 ZIP 及独立动态库，例如 `cpa-apikey-manager-0.3.0-windows-x64.zip` 和 `cpa-apikey-manager-0.3.0-windows-x64.dll`。
+加上 `-ReleaseAssets` 会按 CPA 插件商店格式生成包含版本和平台的 ZIP，例如 `cpa-apikey-manager_0.3.0_windows_amd64.zip`。
 
 也可以直接构建：
 
@@ -232,7 +232,7 @@ cargo build --release --locked
 | 发布已有标签的 GitHub Release | 为该标签补全产物，保留已有发布说明 |
 | Actions → 构建与发布 → Run workflow | 标签留空仅构建；填写已有标签时构建并补全该版本 Release |
 
-每个平台上传一个 ZIP 和一个独立动态库，另提供汇总 `checksums.txt`、中文发布说明和与参考项目格式一致的 `latest.json`。仅在所有平台构建成功后发布完整产物；编译阶段只读仓库，发布阶段才允许写入 Release。Action 固定到提交 SHA，Rust 版本固定在 `rust-toolchain.toml`，依赖使用 `Cargo.lock`。
+每个平台上传一个符合 CPA 插件商店命名规则的 ZIP，另提供汇总 `checksums.txt`、中文发布说明和 `latest.json`。仅在所有平台构建成功后发布完整产物；编译阶段只读仓库，发布阶段才允许写入 Release。Action 固定到提交 SHA，Rust 版本固定在 `rust-toolchain.toml`，依赖使用 `Cargo.lock`。
 
 Actions 临时产物保留 14 天；版本产物保存在 GitHub Releases。Linux 使用 Ubuntu 22.04 构建，macOS 分别使用 Intel 与 Apple Silicon 原生运行器。
 
@@ -267,6 +267,7 @@ src/web.rs         管理接口与页面资源
 ui/               独立中文管理页
 scripts/build.ps1  构建与打包
 scripts/release.mjs  版本校验、发布说明、校验清单与 latest.json
+registry.json  CPA 插件商店注册表
 .github/workflows/build-release.yml  四平台自动构建与发布
 ```
 

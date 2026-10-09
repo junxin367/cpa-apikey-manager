@@ -4,15 +4,15 @@ import { appendFileSync, readFileSync, readdirSync, writeFileSync } from "node:f
 import { join } from "node:path";
 
 const platforms = [
-  ["windows-x64", "dll"],
-  ["linux-x64", "so"],
-  ["macos-x64", "dylib"],
-  ["macos-arm64", "dylib"],
+  ["windows", "amd64"],
+  ["linux", "amd64"],
+  ["darwin", "amd64"],
+  ["darwin", "arm64"],
 ];
 const semver = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const git = (...args) => execFileSync("git", args, { encoding: "utf8" }).trim();
-const assetsFor = (version) => platforms.flatMap(([platform, extension]) =>
-  [`cpa-apikey-manager-${version}-${platform}.zip`, `cpa-apikey-manager-${version}-${platform}.${extension}`]);
+const assetsFor = (version) => platforms.map(([goos, goarch]) =>
+  `cpa-apikey-manager_${version}_${goos}_${goarch}.zip`);
 
 function versionFromTag(tag) {
   const version = tag.replace(/^[vV]/, "");
@@ -28,6 +28,27 @@ function packageVersion() {
   const version = section?.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
   if (!version) throw new Error("无法读取 Cargo.toml 的包版本");
   return version;
+}
+
+function registry() {
+  const document = JSON.parse(readFileSync("registry.json", "utf8"));
+  if (document.schema_version !== 1 || !Array.isArray(document.plugins)) {
+    throw new Error("registry.json 必须使用 schema_version 1 和 plugins 数组");
+  }
+  const plugin = document.plugins.find((item) => item?.id === "cpa-apikey-manager");
+  if (!plugin) throw new Error("registry.json 缺少 cpa-apikey-manager");
+  for (const field of ["name", "description", "author", "repository", "license"]) {
+    if (typeof plugin[field] !== "string" || !plugin[field].trim()) {
+      throw new Error(`registry.json 插件字段 ${field} 不能为空`);
+    }
+  }
+  if (plugin.version !== packageVersion()) {
+    throw new Error(`registry.json 版本 ${plugin.version} 与 Cargo.toml 不一致`);
+  }
+  if (!/^https:\/\/github\.com\/[^/]+\/[^/]+\/?$/.test(plugin.repository)) {
+    throw new Error("registry.json repository 必须是 GitHub 仓库地址");
+  }
+  process.stdout.write(`registry=cpa-apikey-manager@${plugin.version}\n`);
 }
 
 function metadata() {
@@ -61,10 +82,9 @@ function notes(tag, repo) {
   const lines = [
     `## ${tag}`, "", `CPA API 密钥权限与额度管理 ${version}。`, "",
     "### 变更", "", ...changes, "", "### 下载与安装", "",
-    ...platforms.map(([platform]) => `- ${platform}：\`cpa-apikey-manager-${version}-${platform}.zip\``),
+    ...platforms.map(([goos, goarch]) => `- ${goos}/${goarch}：\`cpa-apikey-manager_${version}_${goos}_${goarch}.zip\``),
     "", "解压 ZIP，将其中的插件动态库放入 CLIProxyAPI 的 plugins 目录，再按 README 配置。",
-    "也可以下载独立动态库，安装时重命名为 cpa-apikey-manager.dll、cpa-apikey-manager.so 或 cpa-apikey-manager.dylib。",
-    "", "`checksums.txt` 包含所有 ZIP 和独立动态库的 SHA-256；`latest.json` 在全部平台产物上传后生成。",
+    "", "`checksums.txt` 包含所有平台 ZIP 的 SHA-256；`latest.json` 在全部平台产物上传后生成。",
     "四个平台由 GitHub Actions 构建；宿主功能验收范围以仓库验证记录为准。",
     "", `[安装说明](${base}/blob/${tag}/README.md) · [验证记录](${base}/blob/${tag}/docs/verification.md)`,
     "", previous ? `[完整变更](${base}/compare/${previous}...${tag})` : `[版本提交](${base}/commits/${tag})`, "",
@@ -106,9 +126,10 @@ function manifest(input, output) {
 
 const [command, ...args] = process.argv.slice(2);
 switch (command) {
+  case "registry": registry(); break;
   case "metadata": metadata(); break;
   case "notes": notes(...args); break;
   case "checksums": checksums(...args); break;
   case "manifest": manifest(...args); break;
-  default: throw new Error("用法：node scripts/release.mjs metadata|notes|checksums|manifest");
+  default: throw new Error("用法：node scripts/release.mjs registry|metadata|notes|checksums|manifest");
 }
