@@ -141,7 +141,7 @@ fn registration() -> Value {
     json!({"schema_version":6,
         "metadata":{"Name":"API 密钥权限与额度","Version":env!("CARGO_PKG_VERSION"),
         "Author":"cpa-apikey-manager","GitHubRepository":option_env!("CPA_PLUGIN_REPOSITORY").unwrap_or(env!("CARGO_PKG_REPOSITORY")),"ConfigFields":[
-            {"Name":"cpa-config-path","Type":"string","Description":"宿主配置文件绝对路径（只读）"},
+            {"Name":"cpa-config-path","Type":"string","Description":"可选；默认自动识别宿主 -config 参数或工作目录 config.yaml"},
             {"Name":"cpa-base-url","Type":"string","Description":"宿主地址，用于读取模型目录"},
             {"Name":"data-dir","Type":"string","Description":"SQLite 数据目录"}]},
         "capabilities":{"request_interceptor":true,"request_lifecycle_plugin":true,"usage_plugin":true,"management_api":true}})
@@ -169,7 +169,7 @@ fn dispatch(method: &str, data: &Value) -> Value {
                     .map_err(|_| "插件 YAML 配置无效".to_string())
             });
         let result = config.and_then(|config| {
-            config.validate()?;
+            let config = config.resolve()?;
             if let Some(engine) = state.engine.as_mut() {
                 if engine.config.data_dir != config.data_dir {
                     return Err("修改数据目录需要重启宿主".into());

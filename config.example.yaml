@@ -8,8 +8,9 @@ plugins:
     cpa-apikey-manager:
       enabled: true
       priority: 0
-      # 必填：正在运行的宿主所使用的配置文件绝对路径。
-      cpa-config-path: "C:/CLIProxyAPI/config.yaml"
+      # 可选：默认自动识别宿主的 -config/--config 参数；未指定参数时读取工作目录 config.yaml。
+      # 外部配置存储或其他非标准部署无法自动识别时，再填写实际配置文件绝对路径。
+      # cpa-config-path: "C:/CLIProxyAPI/config.yaml"
       # 用于同步模型目录，只请求 /v1/models，不执行模型推理。
       cpa-base-url: "http://127.0.0.1:8317"
       # 推荐绝对路径。备份此目录即备份账本、规则及密钥 HMAC 标识密钥。

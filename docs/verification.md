@@ -1,10 +1,18 @@
 # 验证记录
 
-验证日期：2026-09-30。
+验证日期：2026-10-09。
 
 环境：Windows x64、Rust 1.95.0，服务器系统时区为 `Asia/Shanghai`。v0.1.0 基线使用 CLIProxyAPI v8.0.4 官方 Windows 二进制，宿主提交 `d33f63f8e3d98428440ebca5a5b6a981a61ff71e`。
 
 所有模型推理使用本机模拟上游和临时密钥，没有调用收费模型，也未修改用户已有部署。基线价格目录同时进行了可控模拟和真实公开 GET 验证。以下分别记录新增功能和原有基线，基线宿主与浏览器结果不代表已对新版本重复验收。
+
+## v0.3.1 内嵌页面与配置路径识别
+
+- 页面资源 CSP 移除 `frame-ancestors 'none'`，覆盖宿主管理前端通过同源或跨来源 API 地址 iframe 内嵌的场景。
+- `cpa-config-path` 为空时，插件从宿主进程参数识别 `-config path`、`--config path`、`-config=path` 和 `--config=path`；相对路径按宿主工作目录解析。
+- 宿主未传配置参数时，插件使用宿主相同的默认规则：工作目录下的 `config.yaml`。
+- 5 项 Rust 回归测试覆盖四种路径解析分支及同源 iframe CSP；同时执行完整 `cargo test --locked`、`cargo fmt --check`、JavaScript 语法检查和发布注册表校验。
+- 外部配置存储等无法从宿主进程参数确定实际文件路径的部署，仍需显式设置 `cpa-config-path`。
 
 ## v0.3.0 总额度开关与渠道模式：20 项后台测试通过
 

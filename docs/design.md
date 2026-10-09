@@ -1,6 +1,6 @@
 # 设计与实现
 
-更新日期：2026-09-30。
+更新日期：2026-10-09。
 
 ## 功能边界
 
@@ -16,6 +16,8 @@
 
 - Rust `cdylib`，插件 ID `cpa-apikey-manager`；页面嵌入动态库。
 - 接入基线为 CLIProxyAPI v8.0.4，提交 `d33f63f8e3d98428440ebca5a5b6a981a61ff71e`，C ABI v1 / RPC schema 6。
+- 页面资源不设置 `frame-ancestors`，兼容宿主管理前端通过同源或跨来源 API 地址 iframe 内嵌。
+- `cpa-config-path` 可省略：优先识别宿主进程的 `-config/--config` 参数，未指定时使用宿主工作目录下的 `config.yaml`；外部配置存储等无法从进程参数确定路径的部署继续使用显式配置。
 - 使用请求前、凭据选择后、请求完成和用量回调；业务拒绝通过显式终止响应返回，不能以普通插件异常代替。
 - 身份来自宿主已认证的 `caller_scope`。密钥明文只在内存中，SQLite 保存 HMAC 标识和脱敏显示值。
 - v8 `access.api-keys` 优先，兼容旧根级字符串列表；源文件失败与有效空列表区分。

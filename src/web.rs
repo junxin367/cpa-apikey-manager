@@ -21,7 +21,7 @@ pub fn response(status: u16, content_type: &str, body: &str) -> Value {
     json!({"StatusCode":status,"Headers":{
         "Content-Type":[content_type],"Cache-Control":["no-store"],
         "X-Content-Type-Options":["nosniff"],"Referrer-Policy":["no-referrer"],
-        "Content-Security-Policy":["default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"]
+        "Content-Security-Policy":["default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'"]
     },"Body":encode(body)})
 }
 pub fn registration(req: &Value) -> Value {
@@ -70,6 +70,20 @@ pub fn handle(engine: &mut Engine, req: &Value) -> Value {
             "application/json; charset=utf-8",
             &error.json().to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response;
+
+    #[test]
+    fn resources_allow_management_embedding() {
+        let value = response(200, "text/html; charset=utf-8", "");
+        let policy = value["Headers"]["Content-Security-Policy"][0]
+            .as_str()
+            .unwrap_or("");
+        assert!(!policy.contains("frame-ancestors"));
     }
 }
 fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
