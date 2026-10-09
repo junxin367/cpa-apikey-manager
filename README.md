@@ -227,14 +227,11 @@ cargo build --release --locked
 
 | 触发方式 | 行为 |
 | --- | --- |
-| 推送 `main`、提交 Pull Request | 检查 Rust 格式、JavaScript 语法，执行 `cargo test --locked`，构建四个平台并保存 Actions 产物 |
-| 推送 `v*`／`V*` 版本标签 | 校验标签与 Cargo 版本一致，完成全部构建后自动创建或补全 GitHub Release |
-| 发布已有标签的 GitHub Release | 为该标签补全产物，保留已有发布说明 |
-| Actions → 构建与发布 → Run workflow | 标签留空仅构建；填写已有标签时构建并补全该版本 Release |
+| 推送 `v*` 版本标签 | 校验标签与 Cargo 版本一致，执行源码检查和四平台构建，随后自动创建或补全 GitHub Release |
 
 每个平台上传一个符合 CPA 插件商店命名规则的 ZIP，另提供汇总 `checksums.txt`、中文发布说明和 `latest.json`。仅在所有平台构建成功后发布完整产物；编译阶段只读仓库，发布阶段才允许写入 Release。Action 固定到提交 SHA，Rust 版本固定在 `rust-toolchain.toml`，依赖使用 `Cargo.lock`。
 
-Actions 临时产物保留 14 天；版本产物保存在 GitHub Releases。Linux 使用 Ubuntu 22.04 构建，macOS 分别使用 Intel 与 Apple Silicon 原生运行器。
+普通分支推送和 Pull Request 不触发本工作流。标签构建产生的 Actions 临时产物保留 14 天，正式版本产物保存在 GitHub Releases。Linux 使用 Ubuntu 22.04 构建，macOS 分别使用 Intel 与 Apple Silicon 原生运行器。
 
 发布新版本时先更新 `Cargo.toml` 的 `version`，运行 Cargo 同步 `Cargo.lock` 并提交，再推送同版本标签，例如：
 

@@ -2,24 +2,14 @@ name: 构建与发布
 
 on:
   push:
-    branches: [main]
-    tags: ["v*", "V*"]
-  pull_request:
-  release:
-    types: [published]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "已有版本标签，例如 v0.1.0；留空只构建，不发布"
-        required: false
-        type: string
+    tags: ["v*"]
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-release-${{ github.event.release.tag_name || inputs.tag || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && inputs.tag == '' && github.event_name != 'release') }}
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,13 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
       - name: 校验标签与 Cargo 版本
         id: metadata
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: node scripts/release.mjs metadata
 
   check:
@@ -123,7 +113,6 @@ jobs:
 
   publish:
     name: 发布全部平台产物
-    if: needs.metadata.outputs.tag != '' && github.event_name != 'pull_request'
     needs: [metadata, build]
     runs-on: ubuntu-latest
     permissions:
