@@ -315,6 +315,23 @@ impl Engine {
                 )
             })
     }
+    pub fn search_key_ids(&self, query: &str) -> Result<Vec<String>> {
+        let query = query.trim();
+        if query.is_empty() || query.chars().count() > 512 {
+            return Err(Fault::new(
+                400,
+                "invalid_query",
+                "密钥搜索内容必须为 1～512 个字符",
+            ));
+        }
+        let query = query.to_lowercase();
+        Ok(self
+            .keys
+            .values()
+            .filter(|key| key.raw.to_lowercase().contains(&query))
+            .map(|key| key.id.clone())
+            .collect())
+    }
     pub fn sync(&mut self) -> Result<()> {
         match self.sync_inner() {
             Ok(()) => {
@@ -1368,6 +1385,11 @@ mod key_reveal_tests {
     fn reveals_only_a_current_key_by_internal_id() {
         let engine = engine_with_key();
         assert_eq!(engine.reveal_key("key-id").unwrap(), "sk-complete-test-key");
+        assert_eq!(
+            engine.search_key_ids("COMPLETE").unwrap(),
+            vec!["key-id".to_string()]
+        );
+        assert!(engine.search_key_ids("missing").unwrap().is_empty());
         let error = engine.reveal_key("missing").unwrap_err();
         assert_eq!(error.status, 404);
         assert_eq!(error.code, "key_not_found");

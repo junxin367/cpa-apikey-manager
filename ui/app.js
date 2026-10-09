@@ -8,6 +8,10 @@ let priceRowsSignature = "";
 let credentialSource = "";
 let comboboxSequence = 0;
 let savingEnforcement = false;
+let revealingKeys = false;
+const revealedKeys = new Map();
+let keySearchTimer, keySearchSequence = 0;
+let remoteKeyMatches = new Set();
 const credentials = globalThis.CpaCredentials;
 const credentialHost = window.location.host, credentialAgent = navigator.userAgent;
 
@@ -161,6 +165,8 @@ function setView(next) {
 }
 function disconnectCredential(message = "") {
   token = ""; credentialSource = ""; snapshot = null; selected = ""; draft = null; dirty = false;
+  revealedKeys.clear(); revealingKeys = false;
+  clearTimeout(keySearchTimer); remoteKeyMatches.clear(); keySearchSequence++;
   clearTimeout(priceTimer);
   $("timezone-chip").hidden = true;
   setView("settings");
@@ -326,10 +332,13 @@ function markDirty() {
 }
 async function load(preserve = false) {
   const data = await api("/state");
+  if (!preserve) { revealedKeys.clear(); remoteKeyMatches.clear(); }
+  else for (const keyId of revealedKeys.keys()) if (!data.keys.some((key) => key.active && key.id === keyId)) revealedKeys.delete(keyId);
   snapshot = data;
   if (!data.keys.some((key) => key.id === selected)) selected = data.keys.find((k) => k.active)?.id || data.keys[0]?.id || "";
   if (!preserve || !draft) { draft = chosen() ? structuredClone(chosen().policy) : null; dirty = false; }
   render();
+  if ($("key-search").value.trim()) scheduleKeySearch();
 }
 function render() {
   $("version").textContent = "v" + snapshot.version; $("timezone").textContent = "服务器时区：" + snapshot.timezone;
@@ -344,41 +353,53 @@ function render() {
   $("keys-unavailable-reason").textContent = snapshot.source_error || "";
   renderKeys(); renderDetail(); renderPrices();
 }
+function renderRevealAllKeys() {
+  const button = $("reveal-all-keys");
+  const activeKeys = snapshot?.keys.filter((key) => key.active) || [];
+  const allRevealed = activeKeys.length > 0 && activeKeys.every((key) => revealedKeys.has(key.id));
+  button.disabled = revealingKeys || activeKeys.length === 0 || !!snapshot?.source_error;
+  button.setAttribute("aria-pressed", String(allRevealed));
+  button.setAttribute("aria-busy", String(revealingKeys));
+  button.replaceChildren(icon(allRevealed ? "eyeOff" : "eye"), allRevealed ? "隐藏完整" : "查看完整");
+}
+function scheduleKeySearch() {
+  clearTimeout(keySearchTimer);
+  const query = $("key-search").value.trim();
+  const sequence = ++keySearchSequence;
+  remoteKeyMatches.clear();
+  renderKeys();
+  const activeKeys = snapshot?.keys.filter((key) => key.active) || [];
+  if (!query || activeKeys.every((key) => revealedKeys.has(key.id))) return;
+  keySearchTimer = setTimeout(async () => {
+    try {
+      const result = await api("/key-search", "POST", { query });
+      if (sequence !== keySearchSequence) return;
+      remoteKeyMatches = new Set(Array.isArray(result.key_ids) ? result.key_ids : []);
+      renderKeys();
+    } catch (error) {
+      if (sequence === keySearchSequence) notify(error.message, true);
+    }
+  }, 180);
+}
 function renderKeys() {
   const search = $("key-search").value.trim().toLowerCase();
-  const keys = snapshot.keys.filter((k) => (k.masked + k.policy.note).toLowerCase().includes(search));
+  const keys = snapshot.keys.filter((key) =>
+    (key.masked + key.policy.note + (revealedKeys.get(key.id) || "")).toLowerCase().includes(search)
+      || remoteKeyMatches.has(key.id));
   $("key-list").replaceChildren(...keys.map((key) => {
-    const value = el(key.policy.note ? "small" : "span", { class: "key-mask" }, key.masked);
-    const reveal = el("button", {
-      class: "key-card-action ghost", type: "button", disabled: !key.active, "aria-pressed": "false",
-      "aria-label": `查看 ${key.policy.note || key.masked} 的完整密钥`,
-      onclick: () => guard(async () => {
-        if (reveal.getAttribute("aria-pressed") === "true") {
-          value.textContent = key.masked; value.classList.remove("revealed");
-          reveal.replaceChildren(icon("eye"), "查看"); reveal.setAttribute("aria-pressed", "false");
-          reveal.setAttribute("aria-label", `查看 ${key.policy.note || key.masked} 的完整密钥`);
-          return;
-        }
-        const restore = pendingButton(reveal, "读取中");
-        try {
-          value.textContent = await rawKey(key.id); value.classList.add("revealed");
-          restore(); reveal.replaceChildren(icon("eyeOff"), "隐藏"); reveal.setAttribute("aria-pressed", "true");
-          reveal.setAttribute("aria-label", `隐藏 ${key.policy.note || key.masked} 的完整密钥`);
-        } catch (error) {
-          restore();
-          throw error;
-        }
-      }),
-    }, icon("eye"), "查看");
+    const raw = revealedKeys.get(key.id);
+    const value = el(key.policy.note ? "small" : "span", { class: "key-mask" + (raw ? " revealed" : "") }, raw || key.masked);
     const copy = el("button", {
       class: "key-card-action ghost", type: "button", disabled: !key.active,
       "aria-label": `复制 ${key.policy.note || key.masked} 的完整密钥`,
       onclick: () => guard(async () => {
-        const restore = pendingButton(copy, "复制中");
+        copy.disabled = true; copy.setAttribute("aria-busy", "true");
         try {
-          await copyText(await rawKey(key.id));
+          await copyText(raw || await rawKey(key.id));
           notify("完整密钥已复制");
-        } finally { restore(); }
+        } finally {
+          copy.disabled = !key.active; copy.removeAttribute("aria-busy");
+        }
       }),
     }, icon("copy"), "复制");
     const selectKey = el("button", {
@@ -396,9 +417,10 @@ function renderKeys() {
       selectKey,
       el("div", { class: "key-card-footer" },
         el("span", { class: "badge" + (key.active ? "" : " danger") }, key.active ? "有效" : "已删除"),
-        el("span", { class: "key-card-actions" }, reveal, copy)));
+        el("span", { class: "key-card-actions" }, copy)));
   }));
   if (!keys.length) $("key-list").append(el("div", { class: "empty compact" }, el("p", {}, search ? "没有匹配的密钥" : "宿主暂无 API 密钥，请先在宿主中创建。"), search ? el("button", { class: "secondary", onclick: () => { $("key-search").value = ""; renderKeys(); } }, "清除搜索") : null));
+  renderRevealAllKeys();
 }
 function renderDetail() {
   const key = chosen(); $("key-empty").hidden = !!key; $("key-detail").hidden = !key;
@@ -776,7 +798,30 @@ $("total-quota-enabled").onchange = () => {
 };
 $("key-period").onchange = () => { draft.period = $("key-period").value; markDirty(); renderDetail(); };
 $("discard").onclick = () => confirmLeave(() => { draft = structuredClone(chosen().policy); dirty = false; renderDetail(); });
-$("key-search").oninput = renderKeys;
+$("key-search").oninput = scheduleKeySearch;
+$("reveal-all-keys").onclick = () => guard(async () => {
+  const activeKeys = snapshot?.keys.filter((key) => key.active) || [];
+  if (activeKeys.length === 0) return;
+  if (activeKeys.every((key) => revealedKeys.has(key.id))) {
+    revealedKeys.clear();
+    renderKeys();
+    notify("完整密钥已隐藏");
+    return;
+  }
+  revealingKeys = true;
+  renderRevealAllKeys();
+  try {
+    const values = await Promise.all(
+      activeKeys.map(async (key) => [key.id, revealedKeys.get(key.id) || await rawKey(key.id)]),
+    );
+    for (const [keyId, value] of values) revealedKeys.set(keyId, value);
+    renderKeys();
+    notify("已显示全部有效密钥");
+  } finally {
+    revealingKeys = false;
+    renderRevealAllKeys();
+  }
+});
 $("add-restriction").onclick = () => addRestriction();
 $("empty-add-restriction").onclick = () => addRestriction();
 $("sync-models").onclick = () => guard(async () => {
