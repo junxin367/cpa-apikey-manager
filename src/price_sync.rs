@@ -376,6 +376,31 @@ fn synchronize(
         }
         status.sources.push(report);
     }
+    // Second pass only after every exact match failed, so an exact name in a later source
+    // still wins over a compatible name in an earlier one.
+    for source in Source::ORDER {
+        if missing.is_empty() || cancelled() {
+            break;
+        }
+        let Some(Ok(catalog)) = cache.get(&source).map(|cached| cached.catalog.as_ref()) else {
+            continue;
+        };
+        let mut matched = 0;
+        for model in missing.clone() {
+            if let Some(entry) = catalog.select_compatible(&model) {
+                selected.push((model.clone(), source, entry.clone()));
+                missing.remove(&model);
+                matched += 1;
+            }
+        }
+        if let Some(report) = status
+            .sources
+            .iter_mut()
+            .find(|r| r.source == source.name())
+        {
+            report.matched += matched;
+        }
+    }
     if cancelled() {
         return Err("价格同步已取消".into());
     }

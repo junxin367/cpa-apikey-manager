@@ -1,11 +1,12 @@
 //! Product channels describe model families. Antigravity is the one upstream-based channel:
 //! it is known only after the host selects credentials, from the upstream request format.
-pub const ALL: [(&str, &str); 7] = [
+pub const ALL: [(&str, &str); 8] = [
     ("gpt", "GPT"),
     ("claude", "Claude"),
     ("deepseek", "DeepSeek"),
     ("glm", "GLM"),
     ("kimi", "Kimi"),
+    ("gemini", "Gemini"),
     ("antigravity", "Antigravity"),
     ("other", "其他"),
 ];
@@ -18,6 +19,12 @@ pub fn label(id: &str) -> &'static str {
 
 pub fn valid(id: &str) -> bool {
     ALL.iter().any(|(key, _)| *key == id)
+}
+
+/// A bare Kimi version root such as `k2` or `k3`.
+pub fn kimi_short(root: &str) -> bool {
+    root.strip_prefix('k')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
 }
 
 /// Channel of one execution. `upstream_format` is the host's `ToFormat`, which is set only
@@ -43,6 +50,9 @@ pub fn classify(model: &str) -> &'static str {
         "deepseek" => "deepseek",
         "glm" => "glm",
         "kimi" | "moonshot" => "kimi",
+        "gemini" => "gemini",
+        // CPA exposes Kimi coding models by short names such as "k3" and "k3-256k".
+        _ if kimi_short(root) => "kimi",
         _ if root.strip_prefix('o').is_some_and(|n| {
             n.starts_with(|c: char| ('1'..='9').contains(&c))
                 && n.bytes().all(|c| c.is_ascii_digit())
@@ -110,5 +120,19 @@ mod tests {
         assert_eq!(resolve("claude-sonnet-4-5", Some("claude")), "claude");
         assert_eq!(resolve("claude-sonnet-4-5", None), "claude");
         assert_eq!(classify("antigravity"), "other");
+    }
+
+    #[test]
+    fn classifies_gemini_and_short_kimi_names() {
+        assert_eq!(classify("gemini-3.6-flash-high"), "gemini");
+        assert_eq!(classify("google/gemini-3.8-flash"), "gemini");
+        assert_eq!(label("gemini"), "Gemini");
+        assert_eq!(classify("k3"), "kimi");
+        assert_eq!(classify("k3-256k"), "kimi");
+        assert_eq!(classify("kimi-k3"), "kimi");
+        assert_eq!(classify("claude-opus-4-6-thinking"), "claude");
+        assert_eq!(classify("gpt-image-2.5-flare"), "gpt");
+        assert_eq!(classify("kling-v2"), "other");
+        assert_eq!(classify("k"), "other");
     }
 }

@@ -174,7 +174,7 @@ pub fn normalize(d: &Detail, provider: &str, executor: &str) -> Result<Tokens> {
     })
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Price {
     pub input: String,
     pub output: String,

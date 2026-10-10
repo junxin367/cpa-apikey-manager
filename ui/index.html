@@ -122,7 +122,7 @@
             <span id="price-count" class="filter-count"></span>
           </div>
           <div class="table-scroll" tabindex="0" role="region" aria-label="模型价格表格"><table class="price-table"><thead><tr><th>模型 ID</th><th>渠道</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存读取</th><th class="num">缓存写入</th><th>价格来源</th><th class="actions-head">操作</th></tr></thead><tbody id="price-rows"></tbody></table></div>
-          <p class="price-help">按 models.dev → LiteLLM → OpenRouter 的顺序补全基础文本 Token 价格。缓存价留空时沿用输入价；阶梯、优先级和非 Token 收费需自行核对。</p>
+          <p class="price-help">按 models.dev → LiteLLM → OpenRouter 的顺序补全基础 Token 价格；名称不完全一致时会忽略推理强度后缀、补全官方名称后再匹配，采用的来源模型可在“价格来源”列核对。缓存价留空时沿用输入价；阶梯、优先级和按张等非 Token 收费需自行核对。</p>
         </div>
       </section>
       <section id="settings-view" class="page" hidden>

@@ -143,13 +143,31 @@ function dropdown(options, value, label) {
   sync();
   return control;
 }
-// Keep popup menus inside a scrollable dialog body so they are not clipped.
+// Inside a dialog, popup menus float over it (fixed to the viewport) so they are neither clipped by
+// nor stretch the scrolling body; they open upward when there is more room above the control.
+let placeFloatingMenu = null;
 function fitMenu(root, menu) {
-  const scroller = root.closest(".dialog-content");
-  if (!scroller) { menu.style.maxHeight = ""; return; }
-  const space = scroller.getBoundingClientRect().bottom - root.getBoundingClientRect().bottom - 12;
-  menu.style.maxHeight = Math.max(160, Math.min(240, space)) + "px";
+  const floating = !!root.closest("dialog");
+  menu.classList.toggle("floating", floating);
+  if (!floating) { menu.style.cssText = ""; return; }
+  const place = () => {
+    if (menu.hidden || !root.isConnected) { if (placeFloatingMenu === place) placeFloatingMenu = null; return; }
+    const rect = root.getBoundingClientRect(), gap = 4, margin = 8;
+    const below = innerHeight - rect.bottom - gap - margin, above = rect.top - gap - margin;
+    const up = below < 200 && above > below;
+    Object.assign(menu.style, {
+      left: rect.left + "px", width: rect.width + "px",
+      top: up ? "" : rect.bottom + gap + "px", bottom: up ? innerHeight - rect.top + gap + "px" : "",
+      maxHeight: Math.max(96, Math.min(240, up ? above : below)) + "px",
+    });
+  };
+  placeFloatingMenu = place;
+  place();
 }
+addEventListener("resize", () => placeFloatingMenu?.());
+document.addEventListener("scroll", (event) => {
+  if (placeFloatingMenu && !event.target.closest?.(".combobox-menu")) placeFloatingMenu();
+}, true);
 // Allow/deny switch: checked = allow. Exposes `.value` ("allow" | "deny") like the select it replaces.
 function accessSwitch(value, label, change, disabled = false) {
   const input = el("input", { type: "checkbox", role: "switch", "aria-label": label, checked: value !== "deny", disabled });
@@ -350,17 +368,14 @@ function modelCombobox(values) {
     id: inputId, placeholder: "输入或选择实际模型 ID", maxLength: 256, autocomplete: "off",
     role: "combobox", "aria-label": "实际模型", "aria-autocomplete": "list", "aria-controls": listId, "aria-expanded": "false",
   });
-  const menu = el("div", { id: listId, class: "combobox-menu", role: "listbox", hidden: true });
+  const menu = el("div", { id: listId, class: "combobox-menu dropdown-menu", role: "listbox", hidden: true });
   const toggle = el("button", { class: "combobox-toggle", type: "button", "aria-label": "显示模型列表", "aria-controls": listId }, icon("chevronDown"));
   const root = el("div", { class: "model-combobox" }, input, toggle, menu);
   const allValues = [...new Set(values)].sort((left, right) => left.localeCompare(right));
   let options = [], activeIndex = -1;
   const setActive = (index) => {
     activeIndex = !options.length || index === -1 ? -1 : (index + options.length) % options.length;
-    options.forEach((option, optionIndex) => {
-      option.classList.toggle("active", optionIndex === activeIndex);
-      option.setAttribute("aria-selected", String(optionIndex === activeIndex));
-    });
+    options.forEach((option, optionIndex) => option.classList.toggle("active", optionIndex === activeIndex));
     if (activeIndex >= 0) {
       input.setAttribute("aria-activedescendant", options[activeIndex].id);
       options[activeIndex].scrollIntoView?.({ block: "nearest" });
@@ -372,25 +387,27 @@ function modelCombobox(values) {
     input.focus();
     close();
   };
-  const renderOptions = () => {
-    const query = input.value.trim().toLowerCase();
+  // Typing filters the list; opening it on an already chosen model lists everything, like a dropdown.
+  const renderOptions = (filter) => {
+    const text = input.value.trim(), query = filter || !allValues.includes(text) ? text.toLowerCase() : "";
     const filtered = allValues.filter((value) => value.toLowerCase().includes(query))
       .sort((left, right) => Number(right.toLowerCase().startsWith(query)) - Number(left.toLowerCase().startsWith(query)) || left.localeCompare(right));
     const visible = filtered.slice(0, 60);
     options = visible.map((value, index) => el("button", {
-      id: `${listId}-option-${index}`, class: "combobox-option", type: "button", role: "option", title: value,
+      id: `${listId}-option-${index}`, class: "combobox-option dropdown-option", type: "button", role: "option", tabIndex: -1,
+      title: value, "data-value": value, "aria-selected": String(value === text),
       onmouseenter: () => setActive(index), onclick: () => choose(value),
-    }, value));
+    }, el("span", {}, value), icon("check")));
     const status = !filtered.length
       ? el("div", { class: "combobox-empty" }, query ? "没有匹配模型，可直接使用当前输入。" : "暂无可选择模型，可直接输入模型 ID。")
       : filtered.length > visible.length
         ? el("div", { class: "combobox-more" }, `还有 ${filtered.length - visible.length} 个结果，请继续输入筛选。`)
         : null;
     menu.replaceChildren(...options, ...(status ? [status] : []));
-    setActive(-1);
+    setActive(query ? -1 : visible.indexOf(text));
   };
-  const open = () => {
-    renderOptions();
+  const open = (filter = false) => {
+    renderOptions(filter);
     menu.hidden = false;
     fitMenu(root, menu);
     input.setAttribute("aria-expanded", "true");
@@ -403,9 +420,9 @@ function modelCombobox(values) {
     toggle.setAttribute("aria-label", "显示模型列表");
     activeIndex = -1;
   };
-  input.addEventListener("focus", open);
+  input.addEventListener("focus", () => open());
   input.addEventListener("click", () => { if (menu.hidden) open(); });
-  input.addEventListener("input", open);
+  input.addEventListener("input", () => open(true));
   input.addEventListener("keydown", (event) => {
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
@@ -413,7 +430,7 @@ function modelCombobox(values) {
       setActive(activeIndex < 0 ? (event.key === "ArrowDown" ? 0 : options.length - 1) : activeIndex + (event.key === "ArrowDown" ? 1 : -1));
     } else if (event.key === "Enter" && !menu.hidden && activeIndex >= 0) {
       event.preventDefault();
-      choose(options[activeIndex].textContent);
+      choose(options[activeIndex].dataset.value);
     } else if (event.key === "Escape" && !menu.hidden) {
       event.preventDefault(); event.stopPropagation(); close();
     } else if (event.key === "Tab") close();
@@ -687,14 +704,14 @@ function renderKeys() {
     const blocked = totalDenied(key.policy);
     const scopes = [...(key.policy.total_quota_enabled ? [blocked ? "全部模型禁止" : "总额度"] : []), ...(ruleCount ? ["按" + modeLabel(key.policy.rule_mode) + " " + ruleCount + " 条"] : [])];
     const meta = PERIOD_LABELS[key.policy.period] + " · " + (scopes.length ? scopes.join(" · ") : "未配置限制");
-    const meter = totalMeter(key);
+    const meter = keyMeter(key);
     const flags = [
       key.active ? null : el("span", { class: "badge danger" }, "已删除"),
       blocked ? el("span", { class: "badge danger" }, "已禁止使用") : null,
-      meter?.state === "exhausted" ? el("span", { class: "badge danger" }, "总额度已耗尽") : null,
+      meter?.state === "exhausted" ? el("span", { class: "badge danger" }, meter.label === "总额度" ? "总额度已耗尽" : "额度已耗尽") : null,
       key.total_usage?.review ? el("span", { class: "badge warn" }, "待核对 " + key.total_usage.review) : null,
     ].filter(Boolean);
-    const label = [note || key.masked, meta, ...(meter ? ["总额度已用 " + meter.percent.textContent] : []), ...flags.map((flag) => flag.textContent)].join("，");
+    const label = [note || key.masked, meta, ...(meter ? [meter.label + "已用 " + meter.percent.textContent] : []), ...flags.map((flag) => flag.textContent)].join("，");
     const copy = el("button", {
       class: "key-card-copy ghost icon-button", type: "button", disabled: !key.active, title: "复制完整密钥",
       "aria-label": `复制 ${note || key.masked} 的完整密钥`,
@@ -724,7 +741,8 @@ function renderKeys() {
     el("span", { class: "key-card-meta key-card-line", title: meta }, meta),
     // Fixed-height status row keeps every card the same height with or without a meter or badges.
     el("span", { class: "key-card-status" },
-      meter ? el("span", { class: "key-card-meter" }, meter.bar, meter.percent) : null,
+      meter ? el("span", { class: "key-card-meter", title: meter.description },
+        el("span", { class: "key-card-meter-label" }, meter.label), meter.bar, meter.percent) : null,
       flags.length ? el("span", { class: "key-card-flags" }, flags) : null));
     return el("article", { class: "key-card" + (key.id === selected ? " selected" : "") + (key.active ? "" : " inactive"), role: "listitem", "data-key-id": key.id },
       selectKey, copy);
@@ -745,15 +763,28 @@ function quotaMeter(used, limit) {
   const percent = Math.min(100, ratio * 100);
   const fill = el("span"); fill.style.width = percent + "%";
   return {
-    consumed, max, state,
+    consumed, max, state, ratio,
     bar: el("span", { class: "progress" + (state ? " " + state : ""), role: "progressbar", "aria-label": "额度用量", "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(Math.round(percent)) }, fill),
     percent: el("span", { class: "usage-percent" + (state ? " " + state : "") }, Math.min(999, Math.floor(ratio * 100)) + "%"),
   };
 }
-function totalMeter(key) {
-  const quota = key.policy.total_quota, usage = key.total_usage;
-  if (!key.policy.total_quota_enabled || totalDenied(key.policy) || !quota || !usage || (quota.unit === "money" && usage.unpriced > 0)) return null;
-  return quotaMeter(quota.unit === "money" ? usage.cost : usage.tokens, quota.limit);
+function keyMeter(key) {
+  if (totalDenied(key.policy)) return null;
+  const candidates = [];
+  const add = (label, quota, usage) => {
+    if (!quota || !usage || (quota.unit === "money" && usage.unpriced > 0)) return;
+    const meter = quotaMeter(quota.unit === "money" ? usage.cost : usage.tokens, quota.limit);
+    candidates.push({ ...meter, label, description: `${label}：${formatAmount(meter.consumed)} / ${formatAmount(meter.max)} ${unitLabel(quota.unit)}` });
+  };
+  if (key.policy.total_quota_enabled) add("总额度", key.policy.total_quota, key.total_usage);
+  const channelMode = key.policy.rule_mode === "channel";
+  for (const [id, rule] of Object.entries(activeRules(key.policy))) {
+    if (rule.access === "deny") continue;
+    add(channelMode ? snapshot.channels.find((channel) => channel.id === id)?.label || id : id,
+      rule.quota, channelMode ? key.channel_usage?.[id] : key.quotas?.[id]);
+  }
+  // Different quota units cannot be summed; surface the active quota closest to its limit.
+  return candidates.sort((left, right) => right.ratio - left.ratio)[0] || null;
 }
 // "All models" denied: the key is blocked while the total scope is switched on.
 function totalDenied(policy) { return !!policy.total_quota_enabled && policy.total_access === "deny"; }
@@ -837,6 +868,53 @@ function totalRow() {
         onclick: () => { draft.total_quota_enabled = false; markDirty(); renderDetail(); } }, icon("power"))));
 }
 function usageCell() { return el("td", { class: "cell-usage", "data-label": "本周期用量" }); }
+// Models a money quota depends on: every model for "all", the channel's models, or one model.
+function missingPrices(scope, id) {
+  const models = snapshot.models.filter((model) => !model.targets?.length);
+  if (scope === "model") return id && !models.find((model) => model.id === id)?.price ? [id] : [];
+  return models.filter((model) => (scope === "all" || model.channel === id) && !model.price).map((model) => model.id);
+}
+// Fill missing prices from public catalogs and wait until the background run finishes.
+async function syncMissingPrices() {
+  await api("/sync-prices", "POST");
+  const deadline = Date.now() + 120000;
+  do {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await load(true);
+  } while (snapshot.price_sync?.running && Date.now() < deadline);
+}
+// Money-quota readiness inside quota dialogs. `read()` returns { scope, id, usage, active }; `refresh` re-renders the dialog.
+function priceNotice(read, refresh) {
+  const text = el("span");
+  let syncing = false;
+  const button = el("button", { class: "secondary small", type: "button", onclick: () => guard(async () => {
+    syncing = true; render();
+    try {
+      await syncMissingPrices();
+      const left = missingPrices(read().scope, read().id).length;
+      notify(left ? "已完成价格同步，仍有 " + left + " 个模型未找到公开价格" : "缺失价格已补全");
+    } finally { syncing = false; refresh(); }
+  }) });
+  const node = el("div", { class: "quota-warning price-notice", hidden: true }, text, button);
+  const render = () => {
+    const { scope, id, usage, active } = read();
+    const missing = active ? missingPrices(scope, id) : [], unpriced = active ? usage?.unpriced || 0 : 0;
+    const names = missing.slice(0, 3).join("、") + (missing.length > 3 ? " 等 " + missing.length + " 个模型" : "");
+    const parts = [];
+    if (missing.length) parts.push(scope === "model" ? "该模型尚未设置价格，无法保存金额额度。"
+      : names + " 尚未设置价格，金额额度下" + (missing.length > 1 ? "这些模型" : "该模型") + "的请求会被拒绝。");
+    if (unpriced) parts.push("本周期有 " + unpriced + " 条用量尚未计价，保存时需确认按当前单价补计。");
+    text.textContent = parts.join("");
+    node.hidden = !parts.length;
+    const running = syncing || !!snapshot.price_sync?.running;
+    button.hidden = !missing.length;
+    button.disabled = running;
+    button.replaceChildren(icon("refresh"), running ? "正在同步…" : "同步缺失价格");
+    button.classList.toggle("is-running", running);
+    return { missing, unpriced };
+  };
+  return { node, render };
+}
 function quotaCell(quota, access) {
   return el("td", { class: "cell-quota", "data-label": "额度上限" }, quota
     ? [el("strong", { class: "quota-value" }, formatAmount(quota.limit) + " " + unitLabel(quota.unit)), el("span", { class: "model-family" }, PERIOD_LABELS[draft.period])]
@@ -922,7 +1000,6 @@ function editQuota(model = null, channel = false, enableTotal = false) {
   const total = model === null, key = chosen(), ruleField = channel ? "channel_rules" : "rules", existing = total ? null : draft[ruleField][model];
   const label = total ? "密钥总额度" : channel ? (snapshot.channels.find((item) => item.id === model).label + " 渠道额度") : "单模型额度";
   const quota = total ? draft.total_quota : existing?.quota, usage = total ? key.total_usage : channel ? key.channel_usage[model] : key.quotas[model];
-  const price = snapshot.models.find((item) => item.id === model)?.price;
   let unit = quota?.unit || (total ? "tokens" : "none");
   const amounts = { tokens: unit === "tokens" ? quota?.limit || "" : "", money: unit === "money" ? quota?.limit || "" : "" };
   const amount = numericField({ value: quota?.limit || "", "aria-label": "额度上限", placeholder: "输入额度上限" }, unit);
@@ -933,6 +1010,7 @@ function editQuota(model = null, channel = false, enableTotal = false) {
   const problem = el("p", { class: "quota-warning", hidden: true });
   const limitWarning = el("p", { class: "quota-warning", hidden: true });
   const blocked = total ? draft.total_access === "deny" : existing?.access === "deny";
+  const prices = priceNotice(() => ({ scope: total ? "all" : channel ? "channel" : "model", id: model, usage, active: unit === "money" && !blocked }), () => update());
   const updateLimitWarning = () => {
     const active = !blocked && (total ? enableTotal || draft.total_quota_enabled : true);
     const used = unit === "money" ? usage?.cost : usage?.tokens;
@@ -957,10 +1035,11 @@ function editQuota(model = null, channel = false, enableTotal = false) {
     help.textContent = total ? "全部模型共享。启用后，0 表示阻止新请求；关闭总额度会保留配置与用量。" :
       unit === "none" ? "移除此范围的单独额度，保留权限；已启用的密钥总额度仍生效。" :
       channel ? "该渠道全部实际模型共享额度；金额按各模型自己的价格合计。" : "限制该模型用量。0 表示阻止该模型的新请求。";
-    const unavailable = !total && !channel && unit === "money" && !price && !blocked;
-    problem.hidden = !unavailable && !blocked && !((total || channel) && unit === "money");
-    problem.textContent = (total || channel) ? (blocked ? (total ? "全部模型已禁止使用" : "该渠道已禁止调用") + "；保存额度不会开放权限。 " : "") + (unit === "money" ? "生效的金额额度要求模型已设置价格；历史未计价用量需确认补计。" : "")
-      : unavailable ? "该模型尚未设置价格。请先在“模型价格”页补全价格，或使用 Token 额度。" : "该模型当前禁止调用；保存额度不会开放模型权限。";
+    // A single-model money quota cannot be saved before that model has a price.
+    const { missing } = prices.render();
+    const unavailable = !total && !channel && missing.length > 0;
+    problem.hidden = !blocked;
+    problem.textContent = (total ? "全部模型已禁止使用" : channel ? "该渠道已禁止调用" : "该模型当前禁止调用") + "；保存额度不会开放权限。";
     $("dialog-confirm").disabled = unavailable;
     usedText.textContent = draft.period !== key.policy.period || !usage ? "保存后计算" :
       unit === "money" ? (usage.unpriced ? "待计价" : Number(usage.cost).toLocaleString("zh-CN", { maximumFractionDigits: 6 }) + " USD") : Number(usage.tokens).toLocaleString("zh-CN") + " Token";
@@ -974,7 +1053,7 @@ function editQuota(model = null, channel = false, enableTotal = false) {
   }
   const consent = el("input", { type: "checkbox" });
   const consentField = field("按当前单价补计本周期未计价用量", consent); consentField.className = "reprice-consent"; consentField.hidden = true;
-  const contents = [el("p", { class: total ? "" : "model-name" }, total ? "当前密钥 · 全部模型共享" : channel ? label : model), context, el("div", {}, el("p", { class: "field-label" }, "额度类型"), modes), amountField, help, problem, limitWarning, consentField];
+  const contents = [el("p", { class: total ? "" : "model-name" }, total ? "当前密钥 · 全部模型共享" : channel ? label : model), context, el("div", {}, el("p", { class: "field-label" }, "额度类型"), modes), amountField, help, problem, prices.node, limitWarning, consentField];
   if (total) contents.push(el("p", { class: "fine" }, (enableTotal || draft.total_quota_enabled ? "保存后总额度启用。" : "保存后总额度仍关闭。") + "汇总本周期已记录用量；更早未记录的请求不会补算。"));
   modal("配置" + label, contents, async () => {
     const candidate = structuredClone(draft);
@@ -1007,7 +1086,7 @@ function addRestriction(initialScope = "channel", presetAccess = null) {
   const modelInput = modelPicker.input;
   const accessSelect = accessSwitch("allow", "权限", () => update());
   const channelField = el("div", { class: "field-group" }, el("p", { class: "field-label" }, "选择渠道"), channelSelect.root);
-  const modelField = el("div", { class: "field-group" }, el("label", { for: modelInput.id }, "实际模型"), modelPicker.root);
+  const modelField = el("div", { class: "field-group" }, el("label", { class: "field-label", for: modelInput.id }, "实际模型"), modelPicker.root);
   const accessField = el("div", { class: "field-group access-field" }, el("p", { class: "field-label" }, "权限"), accessSelect.root);
   const targetRow = el("div", { class: "field-row" }, channelField, modelField, accessField);
   const amount = numericField({ "aria-label": "额度上限", placeholder: "输入额度上限" }, unit);
@@ -1016,7 +1095,11 @@ function addRestriction(initialScope = "channel", presetAccess = null) {
   amountField.className = "quota-amount-field";
   const help = el("p", { class: "fine" });
   const modeWarning = el("p", { class: "quota-warning", hidden: true });
-  const priceWarning = el("p", { class: "quota-warning", hidden: true });
+  const prices = priceNotice(() => ({
+    scope, id: scope === "all" ? "" : target(),
+    usage: scope === "all" ? key.total_usage : scope === "channel" ? key.channel_usage?.[target()] : key.quotas?.[target()],
+    active: unit === "money" && accessSelect.value === "allow" && (scope !== "model" || !!target()),
+  }), () => update());
   const consent = el("input", { type: "checkbox" });
   const consentField = field("按当前单价补计本周期未计价用量", consent);
   consentField.className = "reprice-consent"; consentField.hidden = true;
@@ -1081,12 +1164,8 @@ function addRestriction(initialScope = "channel", presetAccess = null) {
     modeWarning.hidden = !switching;
     modeWarning.textContent = switching
       ? "保存后将切换为按" + modeLabel(targetMode) + "限制；当前 " + Object.keys(activeRules(draft)).length + " 条" + modeLabel(draft.rule_mode) + "限制会保留但暂停。" : "";
-    const model = scope === "model" ? snapshot.models.find((item) => item.id === target()) : null;
-    const missingPrice = scope === "model" && unit === "money" && accessSelect.value === "allow" && !model?.price;
-    priceWarning.hidden = !missingPrice && unit !== "money";
-    priceWarning.textContent = missingPrice
-      ? "该模型尚未设置价格，请先在“模型价格”页补全价格，或改用 Token。"
-      : unit === "money" ? "生效的金额额度要求相关模型已有价格；历史未计价用量可能需要确认补计。" : "";
+    const { missing } = prices.render();
+    const missingPrice = scope === "model" && missing.length > 0;
     $("dialog-confirm").disabled = missingPrice;
   };
   channelSelect.onchange = loadSelection; modelInput.oninput = loadSelection;
@@ -1095,7 +1174,7 @@ function addRestriction(initialScope = "channel", presetAccess = null) {
     el("div", {}, el("p", { class: "field-label" }, "限制范围"), scopeModes),
     targetRow,
     quotaGroup,
-    amountField, help, modeWarning, priceWarning, consentField,
+    amountField, help, modeWarning, prices.node, consentField,
   ], async () => {
     const candidate = structuredClone(draft);
     if (scope === "all") {

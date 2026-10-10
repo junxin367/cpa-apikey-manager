@@ -153,6 +153,7 @@ input[aria-invalid="true"] { border-color: var(--color-danger); }
 .field-error { display: block; font-size: var(--font-small); margin-top: var(--space-1); max-width: var(--field-max); white-space: normal; }
 .field-group { display: grid; gap: var(--space-2); }
 .field-group > label { display: block; }
+.field-group > .field-label { margin-bottom: 0; }
 .switch-control { display: inline-flex; align-items: center; gap: var(--space-2); cursor: pointer; color: var(--color-text-primary); font-size: var(--font-body); }
 .switch-control input { appearance: none; position: relative; width: 36px; height: 20px; margin: 0; padding: 0; border-radius: 12px; background: var(--color-border-strong); flex: none; cursor: pointer; transition: background var(--duration-fast); }
 .switch-control input::before { content: ""; display: block; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--color-bg-surface); box-shadow: var(--shadow-raised); transition: transform var(--duration-fast); }
@@ -265,7 +266,10 @@ input[aria-invalid="true"] { border-color: var(--color-danger); }
 .key-card .key-mask.revealed { color: var(--color-text-primary); }
 .key-card .key-card-name .key-mask { font-size: 13px; color: inherit; }
 .key-card-status { width: 100%; height: 20px; display: flex; align-items: center; gap: var(--space-2); margin-top: 2px; overflow: hidden; }
-.key-card-meter { flex: 1 1 auto; min-width: 72px; display: flex; align-items: center; gap: var(--space-2); font-size: var(--font-small); color: var(--color-text-secondary); font-variant-numeric: tabular-nums; }
+.key-card-meter { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: var(--space-2); font-size: var(--font-small); color: var(--color-text-secondary); font-variant-numeric: tabular-nums; }
+.key-card-meter-label { flex: 0 1 auto; max-width: 64px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.key-card-meter .usage-percent { flex: none; }
+.key-card-status:has(.key-card-flags) .key-card-meter-label { display: none; }
 .key-card-meter .progress { flex: 1; max-width: none; margin: 0; height: 4px; }
 .key-card-flags { flex: 0 1 auto; min-width: 0; display: flex; gap: var(--space-1); overflow: hidden; }
 .key-card-flags .badge { flex: none; padding: 0 6px; line-height: 18px; white-space: nowrap; }
@@ -333,7 +337,6 @@ th.num, td.num { text-align: right; }
 .access-switch.denied .access-text { color: var(--color-danger); }
 .access-switch input:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
 .access-field { align-content: start; }
-.access-field .field-label { margin-bottom: 0; }
 .access-field > .access-switch { display: inline-flex; height: var(--control-height); }
 .quota-value { display: block; font-weight: var(--weight-bold); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .model-name { display: block; font-family: var(--font-mono); font-size: 13px; font-weight: var(--weight-medium); max-width: 260px; overflow-wrap: anywhere; }
@@ -432,7 +435,7 @@ th.num, td.num { text-align: right; }
 
 /* Dialog */
 dialog { z-index: var(--z-modal); width: min(560px, calc(100% - 32px)); max-height: calc(100dvh - 48px); padding: 0; color: var(--color-text-primary); background: var(--color-bg-surface); border: 1px solid var(--color-border); border-radius: var(--radius-large); box-shadow: var(--shadow-overlay); overflow: hidden; }
-dialog[open] { animation: appear var(--duration-overlay) ease-out; }
+dialog[open] { animation: dialog-appear var(--duration-overlay) ease-out; }
 dialog::backdrop { background: var(--color-overlay); }
 #dialog-form { display: flex; flex-direction: column; max-height: calc(100dvh - 48px); }
 .dialog-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) var(--space-3) var(--space-3) var(--space-5); border-bottom: 1px solid var(--color-border); }
@@ -453,10 +456,15 @@ dialog::backdrop { background: var(--color-overlay); }
 .field-row { display: grid; grid-template-columns: minmax(0, var(--field-max)) var(--field-cycle); gap: var(--space-4); align-items: start; }
 .field-row .dropdown { max-width: none; }
 .model-combobox { position: relative; width: 100%; max-width: var(--field-max); }
-.model-combobox > input { max-width: none; padding-right: 40px; }
-.combobox-toggle { position: absolute; z-index: 1; top: 1px; right: 1px; width: 34px; height: 30px; padding: 0; color: var(--color-text-secondary); border: 0; border-left: 1px solid var(--color-border); border-radius: 0 5px 5px 0; background: var(--color-bg-surface); }
-.combobox-toggle:hover:not(:disabled) { color: var(--color-primary); border-color: var(--color-border); background: var(--color-bg-muted); }
+.model-combobox > input { max-width: none; padding: 0 36px 0 var(--space-3); }
+.model-combobox > input[aria-expanded="true"] { border-color: var(--color-focus); }
+.combobox-toggle { position: absolute; z-index: 1; top: 1px; right: 1px; bottom: 1px; width: 32px; height: auto; padding: 0; color: var(--color-text-secondary); border: 0; border-radius: 0 5px 5px 0; background: transparent; }
+.combobox-toggle:hover:not(:disabled), .combobox-toggle:active:not(:disabled) { color: var(--color-text-primary); border-color: transparent; background: transparent; }
+.combobox-toggle .icon { transition: transform var(--duration-fast); }
 .combobox-menu { position: absolute; z-index: var(--z-popover); inset: calc(100% + var(--space-1)) 0 auto; max-height: min(240px, 35vh); padding: var(--space-1); overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--color-border-strong); border-radius: var(--radius); background: var(--color-bg-surface); box-shadow: var(--shadow-overlay); }
+.combobox-menu.floating { position: fixed; inset: auto; }
+.dropdown-option > span { min-width: 0; }
+.dropdown-option > .icon { flex: none; }
 .combobox-option { width: 100%; min-height: 32px; height: auto; justify-content: flex-start; padding: 6px var(--space-2); color: var(--color-text-primary); border-color: transparent; background: transparent; font-family: var(--font-mono); font-size: var(--font-small); font-weight: var(--weight-regular); text-align: left; white-space: normal; overflow-wrap: anywhere; }
 .combobox-option.active, .combobox-option:hover:not(:disabled) { color: var(--color-primary); border-color: transparent; background: var(--color-primary-soft); }
 .combobox-empty, .combobox-more { padding: var(--space-3) var(--space-2); color: var(--color-text-secondary); font-size: var(--font-small); }
@@ -475,10 +483,14 @@ dialog::backdrop { background: var(--color-overlay); }
 .quota-amount-field > div { display: grid; gap: var(--space-2); }
 .quota-amount-field input { width: var(--field-note); }
 .quota-warning { color: var(--color-warning); background: var(--color-warning-soft); border: 1px solid var(--color-warning-line); border-radius: var(--radius); padding: var(--space-2) var(--space-3); font-size: var(--font-small); }
+.price-notice { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
+.price-notice > span { min-width: 0; }
+.price-notice > button { flex: none; }
 .reprice-consent { display: flex; align-items: center; flex-direction: row-reverse; justify-content: flex-end; cursor: pointer; }
 .reprice-consent input { width: 16px; height: 16px; flex: none; cursor: pointer; }
 
 @keyframes appear { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes dialog-appear { from { opacity: 0; } to { opacity: 1; } }
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, -8px); } to { opacity: 1; transform: translate(-50%, 0); } }
 @keyframes spin { to { transform: rotate(360deg); } }
 

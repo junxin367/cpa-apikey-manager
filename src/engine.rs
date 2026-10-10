@@ -839,12 +839,18 @@ impl Engine {
             .is_some_and(|p| p.ends_with("/count_tokens"))
         {
             // Token counting has no generation cost, but still enforces model permissions.
+            if !after && policy.rule_mode == "channel" {
+                return Ok(json!({}));
+            }
             let upstream = if after { string(req, "ToFormat") } else { None };
-            let targets = self
-                .aliases
-                .get(requested)
-                .cloned()
-                .unwrap_or_else(|| vec![self.canonical(requested)]);
+            let targets = if after {
+                vec![string(req, "Model").unwrap_or(requested).to_string()]
+            } else {
+                self.aliases
+                    .get(requested)
+                    .cloned()
+                    .unwrap_or_else(|| vec![self.canonical(requested)])
+            };
             for target in targets {
                 let target_channel = channel::resolve(&target, upstream);
                 if !Self::permitted(&policy, requested, &target, target_channel) {
@@ -1728,32 +1734,120 @@ mod key_reveal_tests {
         );
         store_policy(&engine, &policy);
         let scope = crate::config::caller_scope("sk-antigravity-test");
-        let via = |format: &str| {
-            json!({"Metadata":{"caller_scope":scope},"RequestedModel":"claude-sonnet-4-5",
-                "Model":"claude-sonnet-4-5","ToFormat":format,"RequestID":format!("rid-{format}")})
+        let via = |model: &str, format: &str| {
+            json!({"Metadata":{"caller_scope":scope},"RequestedModel":model,
+                "Model":model,"ToFormat":format,"RequestID":format!("rid-{format}-{model}")})
         };
-        // Before credential selection the upstream is unknown, so channel rules wait.
-        assert_eq!(
+        let models = [
+            ("claude-sonnet-4-5", "claude"),
+            ("gemini-3-pro-high", "gemini"),
+        ];
+        for (model, family) in models {
+            // Before credential selection the upstream is unknown, so channel rules wait.
+            assert_eq!(
+                engine
+                    .intercept(&via(model, "antigravity"), false, Utc::now())
+                    .unwrap(),
+                json!({})
+            );
+            let error = engine
+                .intercept(&via(model, "antigravity"), true, Utc::now())
+                .unwrap_err();
+            assert_eq!(error.code, "channel_forbidden");
+            assert!(error.message.contains("Antigravity"), "{}", error.message);
             engine
-                .intercept(&via("antigravity"), false, Utc::now())
-                .unwrap(),
-            json!({})
-        );
-        let error = engine
-            .intercept(&via("antigravity"), true, Utc::now())
-            .unwrap_err();
-        assert_eq!(error.code, "channel_forbidden");
-        assert!(error.message.contains("Antigravity"), "{}", error.message);
-        engine.intercept(&via("claude"), true, Utc::now()).unwrap();
-        let recorded: String = engine
+                .intercept(&via(model, family), true, Utc::now())
+                .unwrap();
+            let recorded: String = engine
+                .db
+                .query_row(
+                    "SELECT channel FROM requests WHERE request_id=?1",
+                    [format!("rid-{family}-{model}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(recorded, family);
+        }
+
+        policy.channel_rules.get_mut("antigravity").unwrap().access = "allow".into();
+        for (_, family) in models {
+            policy.channel_rules.insert(
+                family.into(),
+                Rule {
+                    access: "deny".into(),
+                    quota: None,
+                },
+            );
+        }
+        store_policy(&engine, &policy);
+        for (model, family) in models {
+            let mut request = via(model, "antigravity");
+            request["Metadata"]["request_path"] = json!("/v1/messages/count_tokens");
+            assert_eq!(
+                engine.intercept(&request, false, Utc::now()).unwrap(),
+                json!({})
+            );
+            assert_eq!(
+                engine.intercept(&request, true, Utc::now()).unwrap(),
+                json!({})
+            );
+            request["ToFormat"] = json!(family);
+            assert_eq!(
+                engine
+                    .intercept(&request, true, Utc::now())
+                    .unwrap_err()
+                    .code,
+                "channel_forbidden"
+            );
+        }
+        let count: i64 = engine
             .db
             .query_row(
-                "SELECT channel FROM requests WHERE request_id='rid-claude'",
+                "SELECT COUNT(*) FROM requests WHERE channel='antigravity'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(recorded, "claude");
+        assert_eq!(count, 0, "token counting must not create generation usage");
+
+        policy.channel_rules.get_mut("antigravity").unwrap().quota = Some(Quota {
+            unit: "tokens".into(),
+            limit: "100".into(),
+        });
+        store_policy(&engine, &policy);
+        for (model, _) in models {
+            let request = via(model, "antigravity");
+            assert_eq!(
+                engine.intercept(&request, true, Utc::now()).unwrap(),
+                json!({})
+            );
+            engine
+                .usage(
+                    &json!({
+                        "RequestID":request["RequestID"], "APIKey":"sk-antigravity-test",
+                        "Model":model, "Provider":"antigravity",
+                        "Detail":{"InputTokens":30,"OutputTokens":20,"TotalTokens":50}
+                    }),
+                    Utc::now(),
+                )
+                .unwrap();
+        }
+        let (channel, tokens): (String, i64) = engine
+            .db
+            .query_row(
+                "SELECT channel,SUM(tokens) FROM usage GROUP BY channel",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((channel.as_str(), tokens), ("antigravity", 100));
+        for (model, _) in models {
+            let mut request = via(model, "antigravity");
+            request["RequestID"] = json!(format!("exhausted-{model}"));
+            let rejection = engine.intercept(&request, true, Utc::now()).unwrap();
+            assert_eq!(rejection["StatusCode"], 429);
+            assert_eq!(rejection["Terminate"], true);
+        }
 
         fs::remove_file(config_path).expect("remove source config");
     }
