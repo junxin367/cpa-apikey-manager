@@ -156,17 +156,37 @@ fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
         ("POST", "/key-search") => {
             Ok(json!({"key_ids":engine.search_key_ids(required("query")?)?}))
         }
-        ("PUT", "/settings") => engine.set_enforcement_enabled(
-            data["enforcement_enabled"]
-                .as_bool()
-                .ok_or("缺少 enforcement_enabled 布尔值")?,
-        ),
+        ("PUT", "/settings") => {
+            let mut saved = serde_json::Map::new();
+            if let Some(value) = data.get("enforcement_enabled") {
+                let enabled = value.as_bool().ok_or("enforcement_enabled 必须是布尔值")?;
+                if let Value::Object(fields) = engine.set_enforcement_enabled(enabled)? {
+                    saved.extend(fields);
+                }
+            }
+            if let Some(value) = data.get("timezone") {
+                let name = value.as_str().ok_or("timezone 必须是 IANA 时区名称")?;
+                if let Value::Object(fields) = engine.set_timezone(name)? {
+                    saved.extend(fields);
+                }
+            }
+            if saved.is_empty() {
+                Err("缺少 enforcement_enabled 或 timezone 设置".into())
+            } else {
+                Ok(Value::Object(saved))
+            }
+        }
         ("PUT", "/policy") => {
             let key = required("key_id")?;
             let old = serde_json::to_value(engine.policy(key)?)?;
             let mut policy = data["policy"].clone();
             let object = policy.as_object_mut().ok_or("密钥规则格式无效")?;
-            for field in ["total_quota_enabled", "rule_mode", "channel_rules"] {
+            for field in [
+                "total_quota_enabled",
+                "total_access",
+                "rule_mode",
+                "channel_rules",
+            ] {
                 if !object.contains_key(field) {
                     object.insert(field.into(), old[field].clone());
                 }

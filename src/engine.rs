@@ -3,7 +3,9 @@ use crate::{
     channel::{self, Scope},
     config::{self, Config},
 };
-use chrono::{DateTime, Local, Utc};
+use chrono::{
+    DateTime, FixedOffset, Local, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc,
+};
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -70,6 +72,9 @@ fn default_period() -> String {
 fn default_rule_mode() -> String {
     "model".into()
 }
+fn default_allow() -> String {
+    "allow".into()
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Quota {
@@ -114,6 +119,9 @@ pub struct Policy {
     pub total_quota: Option<Quota>,
     #[serde(default)]
     pub total_quota_enabled: bool,
+    /// Access of the whole "all models" scope; `deny` blocks the key while `total_quota_enabled`.
+    #[serde(default = "default_allow")]
+    pub total_access: String,
     #[serde(default = "default_rule_mode")]
     pub rule_mode: String,
     #[serde(default)]
@@ -129,6 +137,7 @@ impl Default for Policy {
             period: default_period(),
             total_quota: None,
             total_quota_enabled: false,
+            total_access: default_allow(),
             rule_mode: default_rule_mode(),
             channel_rules: BTreeMap::new(),
             rules: BTreeMap::new(),
@@ -149,7 +158,10 @@ impl Policy {
     fn total(&self) -> Option<&Quota> {
         self.total_quota
             .as_ref()
-            .filter(|_| self.total_quota_enabled)
+            .filter(|_| self.total_quota_enabled && !self.total_denied())
+    }
+    fn total_denied(&self) -> bool {
+        self.total_quota_enabled && self.total_access == "deny"
     }
     fn scoped_quotas(&self) -> Vec<(Scope<'_>, &Quota)> {
         let mut quotas = Vec::new();
@@ -266,8 +278,53 @@ impl Engine {
         hmac.update(key.trim().as_bytes());
         hex::encode(hmac.finalize().into_bytes())
     }
-    pub fn timezone(&self) -> Local {
-        Local
+    fn timezone_setting(&self) -> Result<Option<String>> {
+        Ok(self
+            .db
+            // A separate key from any legacy `timezone` row, which must stay ignored.
+            .query_row(
+                "SELECT value FROM meta WHERE name='accounting_timezone'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    /// Accounting zone: the configured IANA zone, or the server's local zone when unset.
+    pub fn timezone(&self) -> Result<Zone> {
+        match self.timezone_setting()? {
+            Some(name) => name.parse::<chrono_tz::Tz>().map(Zone::Named).map_err(|_| {
+                Fault::new(
+                    503,
+                    "invalid_setting",
+                    "已保存的时区设置无效，请在设置页重新选择时区",
+                )
+            }),
+            None => Ok(Zone::Local),
+        }
+    }
+    pub fn timezone_name(&self) -> Result<String> {
+        Ok(self
+            .timezone_setting()?
+            .unwrap_or_else(server_timezone_name))
+    }
+    pub fn set_timezone(&mut self, name: &str) -> Result<Value> {
+        let name = name.trim();
+        let zone: chrono_tz::Tz = name
+            .parse()
+            .map_err(|_| Fault::new(400, "invalid_timezone", format!("不支持的时区：{name}")))?;
+        let canonical = zone.name();
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "INSERT INTO meta(name,value) VALUES('accounting_timezone',?1)
+             ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+            [canonical],
+        )?;
+        tx.execute(
+            "INSERT INTO audit(created,action,subject,detail) VALUES(?1,'setting','accounting_timezone',?2)",
+            params![Utc::now().timestamp_millis(), canonical],
+        )?;
+        tx.commit()?;
+        Ok(json!({"timezone":canonical,"timezone_source":"setting"}))
     }
     pub fn enforcement_enabled(&self) -> Result<bool> {
         let value: String = self.db.query_row(
@@ -518,7 +575,14 @@ impl Engine {
         if !["model", "channel"].contains(&policy.rule_mode.as_str()) {
             return Err("配置方式必须是 model 或 channel".into());
         }
-        if policy.total_quota_enabled && policy.total_quota.is_none() {
+        if !["allow", "deny"].contains(&policy.total_access.as_str()) {
+            return Err("全部模型权限必须是 allow 或 deny".into());
+        }
+        // A denied "all models" scope needs no limit; an allowed one must carry a quota.
+        if policy.total_quota_enabled
+            && policy.total_access == "allow"
+            && policy.total_quota.is_none()
+        {
             return Err("启用总额度前请设置单位和上限；移除上限前请先关闭总额度".into());
         }
         if let Some(quota) = &policy.total_quota {
@@ -570,7 +634,7 @@ impl Engine {
                 .map(|(scope, _)| scope)
                 .collect()
         };
-        let (start, end) = accounting::period_bounds(now, self.timezone(), &policy.period)?;
+        let (start, end) = accounting::period_bounds(now, self.timezone()?, &policy.period)?;
         let mut prices = BTreeMap::new();
         for scope in money_scopes {
             let filter = scope.filter();
@@ -678,26 +742,21 @@ impl Engine {
         tx.commit()?;
         Ok(json!({"model":model,"price":price,"revision":current+1}))
     }
-    fn caller(&self, request: &Value) -> Result<String> {
+    /// Internal key ID of the calling client, or `None` when the request carries no known key.
+    fn caller(&self, request: &Value) -> Option<String> {
         // caller_scope is generated by CPA from its authenticated userApiKey.
         // Do not identify the client from after-auth headers, which contain upstream credentials.
         let scope = request
             .pointer("/Metadata/caller_scope")
             .and_then(Value::as_str)
             .unwrap_or("");
-        self.keys.get(scope).map(|k| k.id.clone()).ok_or_else(|| {
-            Fault::new(
-                403,
-                "unknown_api_key",
-                "请求被拒绝：当前 API 密钥无法识别或已从宿主配置中移除。请检查所用密钥，或联系管理员确认配置。",
-            )
-        })
+        self.keys.get(scope).map(|k| k.id.clone())
     }
-    fn permitted(policy: &Policy, requested: &str, actual: &str) -> bool {
+    fn permitted(policy: &Policy, requested: &str, actual: &str, actual_channel: &str) -> bool {
         if policy.rule_mode == "channel" {
             return !policy
                 .channel_rules
-                .get(channel::classify(actual))
+                .get(actual_channel)
                 .is_some_and(|rule| rule.access == "deny");
         }
         let rules: Vec<_> = [requested, actual]
@@ -709,19 +768,54 @@ impl Engine {
         }
         true
     }
-    fn denied(policy: &Policy, actual: &str) -> Fault {
+    fn denied(policy: &Policy, actual: &str, actual_channel: &str) -> Fault {
         if policy.rule_mode == "channel" {
-            Fault::new(403, "channel_forbidden", format!("请求被拒绝：当前 API 密钥无权调用渠道「{}」（实际模型「{actual}」）。请联系管理员开通渠道权限。", channel::label(channel::classify(actual))))
+            Fault::new(403, "channel_forbidden", format!("请求被拒绝：当前 API 密钥无权调用渠道「{}」（实际模型「{actual}」）。请联系管理员开通渠道权限。", channel::label(actual_channel)))
         } else {
             Fault::model_forbidden(actual)
         }
     }
     pub fn intercept(&mut self, req: &Value, after: bool, now: DateTime<Utc>) -> Result<Value> {
-        self.sync()?;
-        let key = self.caller(req)?;
+        // CPA stamps this source for host.model.execute calls, never from client headers/body.
+        // Only host-owned requests without a client identity bypass client-key policy;
+        // nested executions retaining caller_scope must still enforce that client's rules.
+        if req.pointer("/Metadata/source").and_then(Value::as_str)
+            == Some("plugin_host_model_callback")
+            && match req.pointer("/Metadata/caller_scope") {
+                None => true,
+                Some(Value::String(scope)) => scope.is_empty(),
+                _ => false,
+            }
+        {
+            return Ok(json!({}));
+        }
+        // Only a recognised client key with effective restrictions is processed; everything
+        // else passes through. A failed sync keeps the last known keys, so restricted keys stay
+        // enforced; an unmatched caller is only rejected when the key list cannot be read.
+        let sync_error = self.sync().err();
+        let has_scope = req
+            .pointer("/Metadata/caller_scope")
+            .and_then(Value::as_str)
+            .is_some_and(|scope| !scope.is_empty());
+        let Some(key) = self.caller(req) else {
+            return match sync_error {
+                Some(error) if has_scope => Err(error),
+                _ => Ok(json!({})),
+            };
+        };
         let policy = self.policy(&key)?;
         if !policy.enforcement_configured() {
             return Ok(json!({}));
+        }
+        if let Some(error) = sync_error {
+            return Err(error);
+        }
+        if policy.total_denied() {
+            return Err(Fault::new(
+                403,
+                "key_forbidden",
+                "请求被拒绝：当前 API 密钥已被禁止使用全部模型。请联系管理员开通权限。",
+            ));
         }
         if self.health_error.is_some() {
             return Err(Fault::new(
@@ -745,14 +839,16 @@ impl Engine {
             .is_some_and(|p| p.ends_with("/count_tokens"))
         {
             // Token counting has no generation cost, but still enforces model permissions.
+            let upstream = if after { string(req, "ToFormat") } else { None };
             let targets = self
                 .aliases
                 .get(requested)
                 .cloned()
                 .unwrap_or_else(|| vec![self.canonical(requested)]);
             for target in targets {
-                if !Self::permitted(&policy, requested, &target) {
-                    return Err(Self::denied(&policy, &target));
+                let target_channel = channel::resolve(&target, upstream);
+                if !Self::permitted(&policy, requested, &target, target_channel) {
+                    return Err(Self::denied(&policy, &target, target_channel));
                 }
             }
             return Ok(json!({}));
@@ -762,8 +858,13 @@ impl Engine {
         } else {
             self.canonical(requested)
         };
-        if (after || policy.rule_mode == "model") && !Self::permitted(&policy, requested, &actual) {
-            return Err(Self::denied(&policy, &actual));
+        // Channel rules are enforced only after credential selection, when Antigravity is known.
+        let upstream = if after { string(req, "ToFormat") } else { None };
+        let actual_channel = channel::resolve(&actual, upstream);
+        if (after || policy.rule_mode == "model")
+            && !Self::permitted(&policy, requested, &actual, actual_channel)
+        {
+            return Err(Self::denied(&policy, &actual, actual_channel));
         }
         if !after {
             return Ok(json!({}));
@@ -777,7 +878,6 @@ impl Engine {
         // Once a key has effective policy configuration, record every admitted generation so
         // later changes to that key's active quotas can use the existing ledger.
         self.expire_pending(now)?;
-        let actual_channel = channel::classify(&actual);
         let applicable: Vec<_> = policy
             .scoped_quotas()
             .into_iter()
@@ -788,8 +888,8 @@ impl Engine {
             })
             .collect();
         for (scope, quota) in &applicable {
-            let timezone = self.timezone();
-            let timezone_label = server_timezone_name();
+            let timezone = self.timezone()?;
+            let timezone_label = self.timezone_name()?;
             let (start, end) = accounting::period_bounds(now, timezone, &policy.period)?;
             let totals = self.scope_totals(&key, *scope, start, end)?;
             let review = totals["review"].as_i64().unwrap_or(0);
@@ -843,7 +943,7 @@ impl Engine {
                     }
                 );
                 let message = format!(
-                    "请求被拒绝：{subject}{period}已耗尽（已用 {used_text} {unit}，上限 {limit_text} {unit}）。额度将于 {}（服务器时区：{timezone_label}）重置，请等待重置或联系管理员提高额度。",
+                    "请求被拒绝：{subject}{period}已耗尽（已用 {used_text} {unit}，上限 {limit_text} {unit}）。额度将于 {}（结算时区：{timezone_label}）重置，请等待重置或联系管理员提高额度。",
                     reset.with_timezone(&timezone).format("%Y-%m-%d %H:%M:%S")
                 );
                 let body = json!({"error":{"code":"quota_exceeded","message":message,
@@ -1058,7 +1158,7 @@ impl Engine {
     pub fn snapshot(&mut self, now: DateTime<Utc>) -> Result<Value> {
         let _ = self.sync();
         self.expire_pending(now)?;
-        let zone = self.timezone();
+        let zone = self.timezone()?;
         let mut keys = Vec::new();
         let mut stmt = self
             .db
@@ -1169,9 +1269,10 @@ impl Engine {
             |r| r.get(0),
         )?;
         Ok(
-            json!({"version":env!("CARGO_PKG_VERSION"),"timezone":server_timezone_name(),
-            "server_offset_seconds":now.with_timezone(&Local).offset().local_minus_utc(),
-            "timezone_source":"server","currency":"USD",
+            json!({"version":env!("CARGO_PKG_VERSION"),"timezone":self.timezone_name()?,
+            "server_offset_seconds":now.with_timezone(&zone).offset().local_minus_utc(),
+            "timezone_source":if self.timezone_setting()?.is_some() { "setting" } else { "server" },
+            "server_timezone":server_timezone_name(),"currency":"USD",
             "enforcement_enabled":self.enforcement_enabled()?,
             "source_error":self.source_error,"health_error":self.health_error,"recording_since":recording_since,
             "review_count":reviews,"keys":keys,"models":models,
@@ -1292,6 +1393,49 @@ pub fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 }
 pub fn server_timezone_name() -> String {
     iana_time_zone::get_timezone().unwrap_or_else(|_| format!("UTC{}", Local::now().offset()))
+}
+
+/// Accounting time zone; offsets are normalized to `FixedOffset` for formatting.
+#[derive(Clone, Copy, Debug)]
+pub enum Zone {
+    Named(chrono_tz::Tz),
+    Local,
+    Fixed(FixedOffset),
+}
+#[allow(deprecated)]
+impl TimeZone for Zone {
+    type Offset = FixedOffset;
+    fn from_offset(offset: &FixedOffset) -> Self {
+        Zone::Fixed(*offset)
+    }
+    fn offset_from_local_date(&self, local: &NaiveDate) -> LocalResult<FixedOffset> {
+        match self {
+            Zone::Named(zone) => zone.offset_from_local_date(local).map(|o| o.fix()),
+            Zone::Local => Local.offset_from_local_date(local),
+            Zone::Fixed(offset) => LocalResult::Single(*offset),
+        }
+    }
+    fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<FixedOffset> {
+        match self {
+            Zone::Named(zone) => zone.offset_from_local_datetime(local).map(|o| o.fix()),
+            Zone::Local => Local.offset_from_local_datetime(local),
+            Zone::Fixed(offset) => LocalResult::Single(*offset),
+        }
+    }
+    fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+        match self {
+            Zone::Named(zone) => zone.offset_from_utc_date(utc).fix(),
+            Zone::Local => Local.offset_from_utc_date(utc),
+            Zone::Fixed(offset) => *offset,
+        }
+    }
+    fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+        match self {
+            Zone::Named(zone) => zone.offset_from_utc_datetime(utc).fix(),
+            Zone::Local => Local.offset_from_utc_datetime(utc),
+            Zone::Fixed(offset) => *offset,
+        }
+    }
 }
 
 fn decode_policy(text: &str) -> Result<Policy> {
@@ -1416,6 +1560,43 @@ mod key_reveal_tests {
     }
 
     #[test]
+    fn configured_timezone_drives_period_bounds() {
+        let mut engine = engine_with_key();
+        assert!(engine.timezone_setting().unwrap().is_none());
+        engine
+            .db
+            .execute("INSERT INTO meta VALUES('timezone','Europe/Paris')", [])
+            .unwrap();
+        assert!(
+            engine.timezone_setting().unwrap().is_none(),
+            "legacy row ignored"
+        );
+        assert_eq!(
+            engine.set_timezone("Mars/Base").unwrap_err().code,
+            "invalid_timezone"
+        );
+        assert_eq!(
+            engine.set_timezone(" Asia/Shanghai ").unwrap(),
+            json!({"timezone":"Asia/Shanghai","timezone_source":"setting"})
+        );
+        assert_eq!(engine.timezone_name().unwrap(), "Asia/Shanghai");
+        // 2026-10-09T17:30Z is already 10-10 01:30 in Shanghai.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-09T17:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (start, end) =
+            crate::accounting::period_bounds(now, engine.timezone().unwrap(), "day").unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-10-09T16:00:00Z").unwrap();
+        assert_eq!(start, expected.timestamp_millis());
+        assert_eq!(end - start, 86_400_000);
+        engine.set_timezone("America/New_York").unwrap();
+        let (start, _) =
+            crate::accounting::period_bounds(now, engine.timezone().unwrap(), "day").unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-10-09T04:00:00Z").unwrap();
+        assert_eq!(start, expected.timestamp_millis());
+    }
+
+    #[test]
     fn only_effective_key_configuration_enables_enforcement() {
         let mut policy = Policy::default();
         assert!(!policy.enforcement_configured());
@@ -1531,5 +1712,166 @@ mod key_reveal_tests {
         assert_eq!(error.code, "accounting_unavailable");
 
         fs::remove_file(config_path).expect("remove source config");
+    }
+
+    #[test]
+    fn antigravity_channel_is_resolved_from_upstream_format() {
+        let (mut engine, config_path) = synced_engine("sk-antigravity-test");
+        let mut policy = Policy::default();
+        policy.rule_mode = "channel".into();
+        policy.channel_rules.insert(
+            "antigravity".into(),
+            Rule {
+                access: "deny".into(),
+                quota: None,
+            },
+        );
+        store_policy(&engine, &policy);
+        let scope = crate::config::caller_scope("sk-antigravity-test");
+        let via = |format: &str| {
+            json!({"Metadata":{"caller_scope":scope},"RequestedModel":"claude-sonnet-4-5",
+                "Model":"claude-sonnet-4-5","ToFormat":format,"RequestID":format!("rid-{format}")})
+        };
+        // Before credential selection the upstream is unknown, so channel rules wait.
+        assert_eq!(
+            engine
+                .intercept(&via("antigravity"), false, Utc::now())
+                .unwrap(),
+            json!({})
+        );
+        let error = engine
+            .intercept(&via("antigravity"), true, Utc::now())
+            .unwrap_err();
+        assert_eq!(error.code, "channel_forbidden");
+        assert!(error.message.contains("Antigravity"), "{}", error.message);
+        engine.intercept(&via("claude"), true, Utc::now()).unwrap();
+        let recorded: String = engine
+            .db
+            .query_row(
+                "SELECT channel FROM requests WHERE request_id='rid-claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, "claude");
+
+        fs::remove_file(config_path).expect("remove source config");
+    }
+
+    #[test]
+    fn denied_all_models_blocks_the_key_without_a_quota() {
+        let (mut engine, config_path) = synced_engine("sk-total-deny-test");
+        let mut policy = Policy {
+            total_quota_enabled: true,
+            total_access: "deny".into(),
+            ..Policy::default()
+        };
+        assert!(policy.enforcement_configured());
+        assert!(policy.total().is_none());
+        store_policy(&engine, &policy);
+        let request = json!({"Metadata":{"caller_scope":crate::config::caller_scope("sk-total-deny-test")},
+            "RequestedModel":"gpt-5","Model":"gpt-5","RequestID":"rid-total"});
+        for after in [false, true] {
+            let error = engine.intercept(&request, after, Utc::now()).unwrap_err();
+            assert_eq!((error.status, error.code), (403, "key_forbidden"));
+        }
+        // Turning the scope off keeps the deny setting but stops enforcing it.
+        policy.total_quota_enabled = false;
+        assert!(!policy.enforcement_configured());
+        // An allowed scope still needs a limit.
+        policy.total_quota_enabled = true;
+        policy.total_access = "allow".into();
+        let key_id = engine.keys.values().next().unwrap().id.clone();
+        let error = engine
+            .save_policy(&key_id, policy, false, Utc::now())
+            .unwrap_err();
+        assert!(error.message.contains("总额度"), "{}", error.message);
+
+        fs::remove_file(config_path).expect("remove source config");
+    }
+
+    #[test]
+    fn only_known_restricted_keys_are_processed() {
+        let (mut engine, config_path) = synced_engine("sk-restricted-test");
+        fs::write(
+            &config_path,
+            "access:\n  api-keys:\n    - sk-restricted-test\n    - sk-open-test\n",
+        )
+        .unwrap();
+        engine.sync().unwrap();
+        let restricted = engine.keys[&crate::config::caller_scope("sk-restricted-test")]
+            .id
+            .clone();
+        let policy = Policy {
+            total_quota_enabled: true,
+            total_access: "deny".into(),
+            ..Policy::default()
+        };
+        engine
+            .db
+            .execute(
+                "UPDATE keys SET policy=?1 WHERE id=?2",
+                rusqlite::params![serde_json::to_string(&policy).unwrap(), restricted],
+            )
+            .unwrap();
+        let request = |scope: Option<String>| json!({"Metadata":{"caller_scope":scope},"RequestedModel":"gpt-5","Model":"gpt-5","RequestID":"rid"});
+        let unknown = Some(crate::config::caller_scope("sk-not-in-host"));
+        let open = Some(crate::config::caller_scope("sk-open-test"));
+        let limited = Some(crate::config::caller_scope("sk-restricted-test"));
+        let mut outcome = |scope: Option<String>| {
+            engine
+                .intercept(&request(scope), true, Utc::now())
+                .map_err(|error| error.code)
+        };
+        assert_eq!(outcome(None), Ok(json!({})));
+        assert_eq!(outcome(unknown.clone()), Ok(json!({})));
+        assert_eq!(outcome(open.clone()), Ok(json!({})));
+        assert_eq!(outcome(limited.clone()), Err("key_forbidden"));
+
+        // Unreadable host config: known keys are still recognised from the last sync.
+        fs::remove_file(&config_path).expect("remove source config");
+        assert_eq!(outcome(None), Ok(json!({})));
+        assert_eq!(outcome(open), Ok(json!({})));
+        assert_eq!(outcome(limited), Err("key_source_unavailable"));
+        assert_eq!(outcome(unknown), Err("key_source_unavailable"));
+    }
+
+    fn synced_engine(raw_key: &str) -> (Engine, std::path::PathBuf) {
+        let config_path =
+            std::env::temp_dir().join(format!("cpa-apikey-manager-{}.yaml", uuid::Uuid::new_v4()));
+        fs::write(
+            &config_path,
+            format!("access:\n  api-keys:\n    - {raw_key}\n"),
+        )
+        .expect("write source config");
+        let mut db = Connection::open_in_memory().expect("in-memory database");
+        crate::migrations::initialize(&mut db).expect("initialize schema");
+        let mut config = Config::default();
+        config.cpa_config_path = config_path.clone();
+        config.price_sync.enabled = false;
+        let mut engine = Engine {
+            config,
+            db,
+            secret: b"test-secret".to_vec(),
+            keys: BTreeMap::new(),
+            source_hash: String::new(),
+            aliases: BTreeMap::new(),
+            source_error: None,
+            health_error: None,
+            price_sync: None,
+        };
+        engine.sync().unwrap();
+        (engine, config_path)
+    }
+
+    fn store_policy(engine: &Engine, policy: &Policy) {
+        let key_id = engine.keys.values().next().unwrap().id.clone();
+        engine
+            .db
+            .execute(
+                "UPDATE keys SET policy=?1 WHERE id=?2",
+                rusqlite::params![serde_json::to_string(policy).unwrap(), key_id],
+            )
+            .unwrap();
     }
 }
