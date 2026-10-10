@@ -709,7 +709,6 @@ function renderKeys() {
       key.active ? null : el("span", { class: "badge danger" }, "已删除"),
       blocked ? el("span", { class: "badge danger" }, "已禁止使用") : null,
       meter?.state === "exhausted" ? el("span", { class: "badge danger" }, meter.label === "总额度" ? "总额度已耗尽" : "额度已耗尽") : null,
-      key.total_usage?.review ? el("span", { class: "badge warn" }, "待核对 " + key.total_usage.review) : null,
     ].filter(Boolean);
     const label = [note || key.masked, meta, ...(meter ? [meter.label + "已用 " + meter.percent.textContent] : []), ...flags.map((flag) => flag.textContent)].join("，");
     const copy = el("button", {
