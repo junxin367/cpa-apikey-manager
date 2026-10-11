@@ -987,7 +987,7 @@ function channelRow(channel) {
   }
   return el("tr", {},
     el("td", { class: "cell-scope" }, el("strong", {}, channel.label), el("details", { class: "channel-models" },
-      el("summary", {}, "渠道 · " + models.length + " 个已知模型"), el("ul", {}, models.length ? models.map((model) => el("li", {}, model.id)) : el("li", {}, channel.id === "antigravity" ? "按上游 Antigravity 凭据归类，不按模型名" : "暂未发现模型")))),
+      el("summary", {}, channel.legacy ? "历史上游规则" : "渠道 · " + models.length + " 个已知模型"), el("ul", {}, models.length ? models.map((model) => el("li", {}, model.id)) : el("li", {}, channel.legacy ? "仅保留已有权限与额度，不再提供新增；模型按家族归类。" : "暂未发现模型")))),
     el("td", { class: "cell-access", "data-label": "权限" }, access),
     quotaCell(quota, rule?.access),
     cell,

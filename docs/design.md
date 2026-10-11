@@ -12,9 +12,11 @@
 
 渠道按实际模型名动态识别，与上游供应商无关，不再维护固定可选列表。去掉路由路径后，识别模型名首词的字母部分（`qwen3-coder-plus` → `qwen`、`devin/swe-2` → `swe`）；GPT、Codex、ChatGPT 与 o 系列统一为 GPT，Moonshot、Kimi 与 `k2`、`k3` 简写统一为 Kimi。`model_`、Anthropic、区域和 Databricks 包装名中的标准家族统一归类，例如 `model_claude_4_5_opus` → Claude。无法识别家族才归入“其他”。`/state.channels` 由已知模型去重产生；历史规则中的渠道仍返回，但 `identified=false`，前端不可将其作为新增选项，后端也拒绝新增未识别渠道。新家族自动生成渠道 ID 和显示名。
 
-Antigravity 保留上游归类：宿主选中凭据后的拦截（`request.intercept_after`）中 `ToFormat` 为 `antigravity` 时，该次执行归入 Antigravity。它在实际请求记录中出现后才进入可选列表；历史规则仍可编辑。选中凭据前无法得知上游，渠道规则只在选中凭据后检查。模型价格表仍显示模型家族。准入将渠道快照写入请求，结算沿用快照；单目标别名归属目标，多目标别名不根据别名猜渠道。纯 Token 计数只检查权限。
+所有执行均按实际模型家族归类，经过 Antigravity 的 Claude／Gemini 也分别归入 Claude／Gemini，与价格页一致。Antigravity 不再进入新增渠道选项。已有 Antigravity 配置标为“历史上游规则”，仅兼容编辑、删除及原有权限和额度；删除后不能重新新增。选中凭据后的 `ToFormat=antigravity` 仅写入独立的 `legacy_channel` 标记，不覆盖模型家族渠道。模型家族规则与历史上游规则同时存在时，禁止优先，任一额度耗尽均拦截，但只记账一次。渠道规则在选中凭据、实际模型解析完成后检查。准入将渠道与历史上游快照写入请求，自动结算、人工核对及迟到用量都沿用快照；单目标别名归属目标，多目标别名不根据别名猜渠道。纯 Token 计数只检查权限。
 
 数据库 v4 将历史 `other` 记录归入动态识别渠道，保留 Token、费用和时间；Antigravity 不变。原 `other` 规则复制到拆分的新渠道，已有明确规则不覆盖。额度从原“其他”共享上限转为各渠道独立上限；需要全模型共享预算时使用总额度。
+
+数据库 v5 为 `requests` 和 `usage` 添加 `legacy_channel`，将原 Antigravity 记录按模型家族重新归类并保留上游标记，不改 Token、费用、时间或密钥策略。正常渠道用 `channel` 汇总，已有 Antigravity 规则用 `legacy_channel` 汇总；历史上游记录不会生成新增选项。
 
 独立管理页包含 API 密钥、模型价格和凭据设置三个入口。没有默认模型权限开关或用量明细页。内部账本继续支持额度汇总和异常核对。
 

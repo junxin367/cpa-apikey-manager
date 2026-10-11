@@ -1,16 +1,13 @@
-//! Channels are model families identified from model names, so a new family becomes a channel
-//! without code changes. Antigravity is the one upstream-based channel: it is known only after
-//! the host selects credentials, from the upstream request format.
+//! Channels are model families identified from model names, independent of upstream credentials.
 
-/// Brand spellings a capitalised ID would get wrong, plus the two channels that are not families.
-const LABELS: [(&str, &str); 8] = [
+/// Brand spellings a capitalised ID would get wrong, plus the unclassified channel.
+const LABELS: [(&str, &str); 7] = [
     ("gpt", "GPT"),
     ("claude", "Claude"),
     ("deepseek", "DeepSeek"),
     ("glm", "GLM"),
     ("kimi", "Kimi"),
     ("gemini", "Gemini"),
-    ("antigravity", "Antigravity"),
     ("other", "其他"),
 ];
 
@@ -36,13 +33,12 @@ pub fn kimi_short(root: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
 }
 
-/// Channel of one execution. `upstream_format` is the host's `ToFormat`, which is set only
-/// after credential selection; any model served by Antigravity credentials counts as Antigravity.
-pub fn resolve(model: &str, upstream_format: Option<&str>) -> String {
+/// Kept separately from model channels so existing upstream rules retain their usage and limits.
+pub fn legacy(upstream_format: Option<&str>) -> &'static str {
     if upstream_format.is_some_and(|format| format.trim().eq_ignore_ascii_case("antigravity")) {
-        "antigravity".into()
+        "antigravity"
     } else {
-        classify(model)
+        ""
     }
 }
 
@@ -115,6 +111,7 @@ impl<'a> Scope<'a> {
         match self {
             Self::Total => "?2=''",
             Self::Model(_) => "model=?2",
+            Self::Channel("antigravity") => "legacy_channel=?2 AND legacy_channel!=''",
             Self::Channel(_) => "channel=?2",
         }
     }
@@ -145,19 +142,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn antigravity_comes_from_upstream_format_only() {
+    fn upstream_rules_are_separate_from_model_channels() {
         assert!(valid("antigravity"));
         assert_eq!(label("antigravity"), "Antigravity");
-        assert_eq!(
-            resolve("claude-sonnet-4-5", Some("antigravity")),
-            "antigravity"
-        );
-        assert_eq!(
-            resolve("gemini-3-pro-high", Some("Antigravity")),
-            "antigravity"
-        );
-        assert_eq!(resolve("claude-sonnet-4-5", Some("claude")), "claude");
-        assert_eq!(resolve("claude-sonnet-4-5", None), "claude");
+        assert_eq!(legacy(Some("antigravity")), "antigravity");
+        assert_eq!(legacy(Some("Antigravity")), "antigravity");
+        assert_eq!(legacy(Some("claude")), "");
+        assert_eq!(legacy(None), "");
+        assert_eq!(classify("antigravity/claude-sonnet-4-5"), "claude");
+        assert_eq!(classify("antigravity/gemini-3-pro-high"), "gemini");
         assert_eq!(classify("antigravity"), "other");
     }
 

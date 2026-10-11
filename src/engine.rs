@@ -497,8 +497,7 @@ impl Engine {
             _ => model.to_string(),
         }
     }
-    /// Channels of the known models, plus Antigravity once a request has run on it. Only these
-    /// can receive new channel rules.
+    /// Only channels identified from known models can receive new rules.
     fn identified_channels(&self) -> Result<BTreeSet<String>> {
         let mut channels = BTreeSet::new();
         let mut stmt = self.db.prepare("SELECT id FROM models")?;
@@ -511,15 +510,6 @@ impl Engine {
             {
                 channels.insert(channel::classify(&self.canonical(&id)));
             }
-        }
-        let antigravity: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM keys WHERE EXISTS(
-                SELECT 1 FROM requests WHERE requests.key_id=keys.id AND requests.channel='antigravity'))",
-            [],
-            |r| r.get(0),
-        )?;
-        if antigravity {
-            channels.insert("antigravity".into());
         }
         Ok(channels)
     }
@@ -871,9 +861,11 @@ impl Engine {
                     .unwrap_or_else(|| vec![self.canonical(requested)])
             };
             for target in targets {
-                let target_channel = channel::resolve(&target, upstream);
-                if !Self::permitted(&policy, requested, &target, &target_channel) {
-                    return Err(Self::denied(&policy, &target, &target_channel));
+                let target_channel = channel::classify(&target);
+                for scope in [target_channel.as_str(), channel::legacy(upstream)] {
+                    if !Self::permitted(&policy, requested, &target, scope) {
+                        return Err(Self::denied(&policy, &target, scope));
+                    }
                 }
             }
             return Ok(json!({}));
@@ -883,13 +875,16 @@ impl Engine {
         } else {
             self.canonical(requested)
         };
-        // Channel rules are enforced only after credential selection, when Antigravity is known.
+        // Multi-target aliases have a reliable model channel only after credential selection.
         let upstream = if after { string(req, "ToFormat") } else { None };
-        let actual_channel = channel::resolve(&actual, upstream);
-        if (after || policy.rule_mode == "model")
-            && !Self::permitted(&policy, requested, &actual, &actual_channel)
-        {
-            return Err(Self::denied(&policy, &actual, &actual_channel));
+        let actual_channel = channel::classify(&actual);
+        let legacy_channel = channel::legacy(upstream);
+        if after || policy.rule_mode == "model" {
+            for scope in [actual_channel.as_str(), legacy_channel] {
+                if !Self::permitted(&policy, requested, &actual, scope) {
+                    return Err(Self::denied(&policy, &actual, scope));
+                }
+            }
         }
         if !after {
             return Ok(json!({}));
@@ -909,7 +904,7 @@ impl Engine {
             .filter(|(scope, _)| match scope {
                 Scope::Total => true,
                 Scope::Model(id) => *id == actual,
-                Scope::Channel(id) => *id == actual_channel,
+                Scope::Channel(id) => *id == actual_channel || *id == legacy_channel,
             })
             .collect();
         for (scope, quota) in &applicable {
@@ -963,8 +958,12 @@ impl Engine {
                     "请求被拒绝：{subject}{period}已耗尽（已用 {used_text} {unit}，上限 {limit_text} {unit}）。额度将于 {}（结算时区：{timezone_label}）重置，请等待重置或联系管理员提高额度。",
                     reset.with_timezone(&timezone).format("%Y-%m-%d %H:%M:%S")
                 );
+                let exceeded_channel = match scope {
+                    Scope::Channel(id) => *id,
+                    _ => actual_channel.as_str(),
+                };
                 let body = json!({"error":{"code":"quota_exceeded","message":message,
-                    "scope":scope.name(),"channel":actual_channel,"channel_label":channel::label(&actual_channel),
+                    "scope":scope.name(),"channel":exceeded_channel,"channel_label":channel::label(exceeded_channel),
                     "model":actual,"unit":quota.unit,"period":policy.period,
                     "used":used_text,"limit":limit_text,"reset_at":reset.to_rfc3339(),
                     "timezone":timezone_label}});
@@ -990,9 +989,9 @@ impl Engine {
             }
         }
         let price = price.map(|p| serde_json::to_string(&p)).transpose()?;
-        self.db.execute("INSERT OR IGNORE INTO requests(request_id,model,key_id,requested,trace_id,started,status,price,channel)
-            VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8)",
-            params![rid,actual,key,requested,string(req,"TraceID").unwrap_or(""),now.timestamp_millis(),price,actual_channel])?;
+        self.db.execute("INSERT OR IGNORE INTO requests(request_id,model,key_id,requested,trace_id,started,status,price,channel,legacy_channel)
+            VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9)",
+            params![rid,actual,key,requested,string(req,"TraceID").unwrap_or(""),now.timestamp_millis(),price,actual_channel,legacy_channel])?;
         Ok(json!({}))
     }
     pub fn complete(&mut self, req: &Value, now: DateTime<Utc>) -> Result<()> {
@@ -1033,18 +1032,18 @@ impl Engine {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.timestamp_millis())
             .unwrap_or(now.timestamp_millis());
-        let exact: Option<(String,i64,Option<String>,String,String)> = self.db.query_row(
-            "SELECT key_id,started,price,request_id,channel FROM requests WHERE request_id=?1 AND model=?2",
-            params![rid,model], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+        let exact: Option<(String,i64,Option<String>,String,String,String)> = self.db.query_row(
+            "SELECT key_id,started,price,request_id,channel,legacy_channel FROM requests WHERE request_id=?1 AND model=?2",
+            params![rid,model], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
         let pending = match exact {
             Some(value) => Some(value),
             None if !trace.is_empty() && fallback_key.is_some() => self.db.query_row(
-                "SELECT key_id,started,price,request_id,channel FROM requests WHERE trace_id=?1 AND model=?2 AND key_id=?3
+                "SELECT key_id,started,price,request_id,channel,legacy_channel FROM requests WHERE trace_id=?1 AND model=?2 AND key_id=?3
                  AND ABS(started-?4)<86400000 ORDER BY started DESC LIMIT 1",
-                params![trace,model,fallback_key,requested_at], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?,
+                params![trace,model,fallback_key,requested_at], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?,
             _ => None,
         };
-        let (key, started, price, parent_id, request_channel) = match pending {
+        let (key, started, price, parent_id, request_channel, legacy_channel) = match pending {
             Some(pending) => pending,
             None => {
                 // Never infer an earlier admission from today's policy. No credentials in diagnostics.
@@ -1102,9 +1101,9 @@ impl Engine {
             "DELETE FROM usage WHERE request_id=?1 AND model=?2 AND manual=1",
             params![parent_id, model],
         )?;
-        tx.execute("INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,manual,channel)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11)", params![id,parent_id,key,model,started,tokens.total,cost,
-                serde_json::to_string(&tokens)?,record["Failed"].as_bool().unwrap_or(false),record["Stream"].as_bool().unwrap_or(false),request_channel])?;
+        tx.execute("INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,manual,channel,legacy_channel)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12)", params![id,parent_id,key,model,started,tokens.total,cost,
+                serde_json::to_string(&tokens)?,record["Failed"].as_bool().unwrap_or(false),record["Stream"].as_bool().unwrap_or(false),request_channel,legacy_channel])?;
         tx.execute(
             "UPDATE requests SET status=?1 WHERE request_id=?2 AND model=?3",
             params![
@@ -1142,16 +1141,17 @@ impl Engine {
         {
             return Err("Token 明细必须非负且合计一致".into());
         }
-        let row: Option<(String, i64, Option<String>, String)> = self
+        let row: Option<(String, i64, Option<String>, String, String)> = self
             .db
             .query_row(
-                "SELECT key_id,started,price,channel FROM requests
+                "SELECT key_id,started,price,channel,legacy_channel FROM requests
             WHERE request_id=?1 AND model=?2 AND status='review'",
                 params![rid, model],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let (key, started, price, request_channel) = row.ok_or("该请求不在待核对状态")?;
+        let (key, started, price, request_channel, legacy_channel) =
+            row.ok_or("该请求不在待核对状态")?;
         let price = price
             .map(|p| serde_json::from_str::<Price>(&p))
             .transpose()?
@@ -1163,9 +1163,9 @@ impl Engine {
             "DELETE FROM usage WHERE request_id=?1 AND model=?2",
             params![rid, model],
         )?;
-        tx.execute("INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,manual,channel)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,0,1,?9)",
-            params![format!("manual:{rid}:{model}"),rid,key,model,started,tokens.total,cost,serde_json::to_string(&tokens)?,request_channel])?;
+        tx.execute("INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,manual,channel,legacy_channel)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,0,1,?9,?10)",
+            params![format!("manual:{rid}:{model}"),rid,key,model,started,tokens.total,cost,serde_json::to_string(&tokens)?,request_channel,legacy_channel])?;
         tx.execute(
             "UPDATE requests SET status='settled' WHERE request_id=?1 AND model=?2",
             params![rid, model],
@@ -1287,7 +1287,7 @@ impl Engine {
         }
         let mut channel_list: Vec<_> = channels
             .iter()
-            .map(|id| json!({"id":id,"label":channel::label(id),"identified":identified.contains(id)}))
+            .map(|id| json!({"id":id,"label":channel::label(id),"identified":identified.contains(id),"legacy":id=="antigravity"}))
             .collect();
         channel_list.sort_by_key(|item| {
             (
@@ -1338,9 +1338,14 @@ impl Engine {
         }
         self.expire_pending(now)?;
         let mut items = Vec::new();
+        let channel_field = if channel == "antigravity" {
+            "legacy_channel"
+        } else {
+            "channel"
+        };
         if reviews {
-            let mut stmt = self.db.prepare("SELECT request_id,model,key_id,started,status,outcome FROM requests
-                WHERE status='review' AND (?1='' OR key_id=?1) AND (?2='' OR model=?2) AND (?4='' OR channel=?4) ORDER BY started DESC LIMIT 100 OFFSET ?3")?;
+            let mut stmt = self.db.prepare(&format!("SELECT request_id,model,key_id,started,status,outcome FROM requests
+                WHERE status='review' AND (?1='' OR key_id=?1) AND (?2='' OR model=?2) AND (?4='' OR {channel_field}=?4) ORDER BY started DESC LIMIT 100 OFFSET ?3"))?;
             let rows = stmt.query_map(params![key,model,offset.max(0),channel], |r| Ok(json!({"request_id":r.get::<_,String>(0)?,
                 "model":r.get::<_,String>(1)?,"key_id":r.get::<_,String>(2)?,"started":r.get::<_,i64>(3)?,
                 "status":r.get::<_,String>(4)?,"outcome":r.get::<_,Option<String>>(5)?})))?;
@@ -1348,8 +1353,8 @@ impl Engine {
                 items.push(row?);
             }
         } else {
-            let mut stmt = self.db.prepare("SELECT request_id,model,key_id,started,tokens,cost,detail,failed,stream,manual FROM usage
-                WHERE (?1='' OR key_id=?1) AND (?2='' OR model=?2) AND (?4='' OR channel=?4) ORDER BY started DESC LIMIT 100 OFFSET ?3")?;
+            let mut stmt = self.db.prepare(&format!("SELECT request_id,model,key_id,started,tokens,cost,detail,failed,stream,manual FROM usage
+                WHERE (?1='' OR key_id=?1) AND (?2='' OR model=?2) AND (?4='' OR {channel_field}=?4) ORDER BY started DESC LIMIT 100 OFFSET ?3"))?;
             let rows = stmt.query_map(params![key, model, offset.max(0), channel], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -1570,7 +1575,7 @@ pub fn backfill_unpriced(db: &Connection, model: &str, price: &Price) -> rusqlit
 
 #[cfg(test)]
 mod key_reveal_tests {
-    use super::{Engine, Key, Policy, Quota, Rule};
+    use super::{Engine, Key, Policy, Quota, Rule, Scope, Tokens};
     use crate::config::Config;
     use chrono::Utc;
     use rusqlite::Connection;
@@ -1797,7 +1802,7 @@ mod key_reveal_tests {
     }
 
     #[test]
-    fn antigravity_channel_is_resolved_from_upstream_format() {
+    fn model_channels_apply_across_upstreams_and_preserve_legacy_rules() {
         let (mut engine, config_path) = synced_engine("sk-antigravity-test");
         let mut policy = Policy::default();
         policy.rule_mode = "channel".into();
@@ -1864,8 +1869,11 @@ mod key_reveal_tests {
                 json!({})
             );
             assert_eq!(
-                engine.intercept(&request, true, Utc::now()).unwrap(),
-                json!({})
+                engine
+                    .intercept(&request, true, Utc::now())
+                    .unwrap_err()
+                    .code,
+                "channel_forbidden"
             );
             request["ToFormat"] = json!(family);
             assert_eq!(
@@ -1879,7 +1887,7 @@ mod key_reveal_tests {
         let count: i64 = engine
             .db
             .query_row(
-                "SELECT COUNT(*) FROM requests WHERE channel='antigravity'",
+                "SELECT COUNT(*) FROM requests WHERE legacy_channel='antigravity'",
                 [],
                 |row| row.get(0),
             )
@@ -1890,6 +1898,9 @@ mod key_reveal_tests {
             unit: "tokens".into(),
             limit: "100".into(),
         });
+        for (_, family) in models {
+            policy.channel_rules.remove(family);
+        }
         store_policy(&engine, &policy);
         for (model, _) in models {
             let request = via(model, "antigravity");
@@ -1908,15 +1919,24 @@ mod key_reveal_tests {
                 )
                 .unwrap();
         }
-        let (channel, tokens): (String, i64) = engine
+        let (legacy_channel, tokens): (String, i64) = engine
             .db
             .query_row(
-                "SELECT channel,SUM(tokens) FROM usage GROUP BY channel",
+                "SELECT legacy_channel,SUM(tokens) FROM usage GROUP BY legacy_channel",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!((channel.as_str(), tokens), ("antigravity", 100));
+        assert_eq!((legacy_channel.as_str(), tokens), ("antigravity", 100));
+        let channels: Vec<(String, i64)> = engine
+            .db
+            .prepare("SELECT channel,SUM(tokens) FROM usage GROUP BY channel ORDER BY channel")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(channels, [("claude".into(), 50), ("gemini".into(), 50)]);
         for (model, _) in models {
             let mut request = via(model, "antigravity");
             request["RequestID"] = json!(format!("exhausted-{model}"));
@@ -1924,6 +1944,110 @@ mod key_reveal_tests {
             assert_eq!(rejection["StatusCode"], 429);
             assert_eq!(rejection["Terminate"], true);
         }
+        policy.channel_rules.remove("antigravity");
+        policy.channel_rules.insert(
+            "claude".into(),
+            Rule {
+                access: "allow".into(),
+                quota: Some(Quota {
+                    unit: "tokens".into(),
+                    limit: "60".into(),
+                }),
+            },
+        );
+        store_policy(&engine, &policy);
+        let native = via("claude-sonnet-4-5", "claude");
+        engine
+            .usage(
+                &json!({"RequestID":native["RequestID"], "APIKey":"sk-antigravity-test",
+                    "Model":"claude-sonnet-4-5","Provider":"claude",
+                    "Detail":{"InputTokens":6,"OutputTokens":4,"TotalTokens":10}}),
+                Utc::now(),
+            )
+            .unwrap();
+        for format in ["claude", "antigravity"] {
+            let mut request = via("claude-sonnet-4-5", format);
+            request["RequestID"] = json!(format!("family-exhausted-{format}"));
+            assert_eq!(
+                engine.intercept(&request, true, Utc::now()).unwrap()["StatusCode"],
+                429
+            );
+        }
+        let mut request = via("gemini-3-pro-high", "antigravity");
+        request["RequestID"] = json!("review-gemini");
+        let now = Utc::now();
+        engine.intercept(&request, true, now).unwrap();
+        engine
+            .complete(&request, now - chrono::Duration::seconds(31))
+            .unwrap();
+        engine.expire_pending(now).unwrap();
+        let key = engine.keys.values().next().unwrap().id.clone();
+        assert_eq!(
+            engine
+                .scope_totals(&key, Scope::Channel("antigravity"), 0, i64::MAX)
+                .unwrap()["review"],
+            1
+        );
+        assert_eq!(
+            engine
+                .ledger(&key, "", "antigravity", 0, true, now)
+                .unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        engine
+            .settle(
+                "review-gemini",
+                "gemini-3-pro-high",
+                Tokens {
+                    input: 15,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0,
+                    total: 20,
+                    complete: true,
+                },
+                "本地测试核对",
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .scope_totals(&key, Scope::Channel("antigravity"), 0, i64::MAX)
+                .unwrap()["tokens"],
+            "120"
+        );
+        engine
+            .usage(
+                &json!({"RequestID":"review-gemini", "APIKey":"sk-antigravity-test",
+                    "Model":"gemini-3-pro-high","Provider":"antigravity",
+                    "Detail":{"InputTokens":20,"OutputTokens":10,"TotalTokens":30}}),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .scope_totals(&key, Scope::Channel("antigravity"), 0, i64::MAX)
+                .unwrap()["tokens"],
+            "130"
+        );
+        assert_eq!(
+            engine
+                .scope_totals(&key, Scope::Channel("gemini"), 0, i64::MAX)
+                .unwrap()["tokens"],
+            "80"
+        );
+        assert_eq!(
+            engine
+                .ledger(&key, "", "antigravity", 0, false, now)
+                .unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
 
         fs::remove_file(config_path).expect("remove source config");
     }
@@ -2096,6 +2220,11 @@ mod key_reveal_tests {
                 .map(|c| (c["id"].as_str().unwrap().into(), c["identified"] == true))
                 .collect()
         };
+        engine.db.execute(
+            "INSERT INTO requests(request_id,model,key_id,requested,trace_id,started,status,channel,legacy_channel)
+             VALUES('legacy-request','devin/claude-opus-5-5',?1,'devin/claude-opus-5-5','',0,'settled','claude','antigravity')",
+            [&key],
+        ).unwrap();
         assert_eq!(
             listed(&mut engine),
             [("claude".into(), true), ("qwen".into(), true)]
@@ -2114,18 +2243,42 @@ mod key_reveal_tests {
                 .message,
             "已知模型中没有识别到渠道「Grok」，请先同步模型"
         );
+        policy.channel_rules.clear();
+        policy.channel_rules.insert("antigravity".into(), deny());
+        assert!(engine
+            .save_policy(&key, policy.clone(), false, Utc::now())
+            .is_err());
+        policy.channel_rules.insert("grok".into(), deny());
         // A rule saved earlier stays listed and editable after its models are gone.
         store_policy(&engine, &policy);
         assert_eq!(
             listed(&mut engine),
             [
+                ("antigravity".into(), false),
                 ("claude".into(), true),
                 ("grok".into(), false),
                 ("qwen".into(), true)
             ]
         );
+        assert_eq!(
+            engine.snapshot(Utc::now()).unwrap()["channels"][0]["legacy"],
+            true
+        );
         policy.channel_rules.insert("qwen".into(), deny());
         engine.save_policy(&key, policy, false, Utc::now()).unwrap();
+        let mut policy = engine.policy(&key).unwrap();
+        policy.channel_rules.remove("antigravity");
+        engine.save_policy(&key, policy, false, Utc::now()).unwrap();
+        assert!(!listed(&mut engine)
+            .iter()
+            .any(|(id, _)| id == "antigravity"));
+        let mut policy = engine.policy(&key).unwrap();
+        policy.channel_rules.insert("antigravity".into(), deny());
+        assert!(engine.save_policy(&key, policy, false, Utc::now()).is_err());
+        engine.db.execute("DELETE FROM models", []).unwrap();
+        assert!(listed(&mut engine)
+            .iter()
+            .all(|(_, identified)| !identified));
         fs::remove_file(config_path).ok();
     }
 

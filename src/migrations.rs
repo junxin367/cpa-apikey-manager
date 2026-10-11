@@ -35,7 +35,7 @@ fn v3_channel(model: &str) -> &'static str {
 
 pub fn initialize(db: &mut Connection) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > 4 {
+    if version > 5 {
         return Err(Fault::new(
             503,
             "database_version_unsupported",
@@ -176,6 +176,39 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
         tx.execute_batch("PRAGMA user_version=4;")?;
         tx.commit()?;
     }
+    if version < 5 {
+        let tx = db.transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE requests ADD COLUMN legacy_channel TEXT NOT NULL DEFAULT '';
+             ALTER TABLE usage ADD COLUMN legacy_channel TEXT NOT NULL DEFAULT '';",
+        )?;
+        for table in ["requests", "usage"] {
+            let models = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT DISTINCT model FROM {table} WHERE channel='antigravity'"
+                ))?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for model in models {
+                tx.execute(
+                    &format!(
+                        "UPDATE {table} SET channel=?1,legacy_channel='antigravity'
+                         WHERE model=?2 AND channel='antigravity'"
+                    ),
+                    params![channel::classify(&model), model],
+                )?;
+            }
+        }
+        tx.execute_batch(
+            "CREATE INDEX usage_legacy_channel_period ON usage(key_id,legacy_channel,started)
+                 WHERE legacy_channel!='';
+             CREATE INDEX requests_legacy_channel_review ON requests(key_id,legacy_channel,status)
+                 WHERE legacy_channel!='';
+             PRAGMA user_version=5;",
+        )?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -185,7 +218,7 @@ mod tests {
     use rusqlite::Connection;
 
     #[test]
-    fn upgrade_moves_only_name_based_other_rows() {
+    fn upgrade_preserves_rules_and_reclassifies_historical_channels() {
         let mut db = Connection::open_in_memory().unwrap();
         initialize(&mut db).unwrap();
         let row = |rid: &str, model: &str, channel: &str| {
@@ -195,8 +228,14 @@ mod tests {
         db.execute_batch(&format!(
             "{}{}{}{}{}INSERT INTO models(id) VALUES('qwen3-coder-plus');
             INSERT INTO keys(id,masked,active,policy,recording_since) VALUES
-                ('limited','',1,'{{\"rule_mode\":\"channel\",\"channel_rules\":{{\"other\":{{\"access\":\"deny\"}},\"grok\":{{\"access\":\"allow\"}}}}}}',''),
+                ('limited','',1,'{{\"rule_mode\":\"channel\",\"channel_rules\":{{\"other\":{{\"access\":\"deny\"}},\"grok\":{{\"access\":\"allow\"}},\"antigravity\":{{\"access\":\"allow\",\"quota\":{{\"unit\":\"tokens\",\"limit\":\"100\"}}}}}}}}',''),
                 ('open','',1,'{{\"rule_mode\":\"channel\",\"channel_rules\":{{\"gpt\":{{\"access\":\"deny\"}}}}}}','');
+            INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,channel)
+                VALUES('u','c','limited','gemini-3.6-flash-high',123,20,456,'{{}}',0,0,'antigravity');
+            DROP INDEX usage_legacy_channel_period;
+            DROP INDEX requests_legacy_channel_review;
+            ALTER TABLE requests DROP COLUMN legacy_channel;
+            ALTER TABLE usage DROP COLUMN legacy_channel;
             PRAGMA user_version=2;",
             row("a", "gemini-3.6-flash-high", "other"),
             row("b", "k3", "other"),
@@ -216,7 +255,23 @@ mod tests {
         };
         assert_eq!(channel("a"), "gemini");
         assert_eq!(channel("b"), "kimi");
-        assert_eq!(channel("c"), "antigravity");
+        assert_eq!(channel("c"), "gemini");
+        let legacy: String = db
+            .query_row(
+                "SELECT legacy_channel FROM requests WHERE request_id='c'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, "antigravity");
+        let usage: (String, String, i64, i64, i64) = db
+            .query_row(
+                "SELECT channel,legacy_channel,started,tokens,cost FROM usage WHERE id='u'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(usage, ("gemini".into(), "antigravity".into(), 123, 20, 456));
         assert_eq!(channel("d"), "grok");
         assert_eq!(channel("e"), "swe");
         let rules = |key: &str| -> serde_json::Value {
@@ -228,6 +283,7 @@ mod tests {
         let limited = rules("limited");
         assert_eq!(limited["swe"]["access"], "deny");
         assert_eq!(limited["qwen"]["access"], "deny");
+        assert_eq!(limited["antigravity"]["quota"]["limit"], "100");
         assert_eq!(
             limited["grok"]["access"], "allow",
             "existing rules are kept"
@@ -237,6 +293,15 @@ mod tests {
         let version: i64 = db
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
+        initialize(&mut db).unwrap();
+        let channel: String = db
+            .query_row(
+                "SELECT channel FROM requests WHERE request_id='c'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(channel, "gemini");
     }
 }
