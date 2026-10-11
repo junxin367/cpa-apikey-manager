@@ -771,7 +771,7 @@ function keyMeter(key) {
   if (totalDenied(key.policy)) return null;
   const candidates = [];
   const add = (label, quota, usage) => {
-    if (!quota || !usage || (quota.unit === "money" && usage.unpriced > 0)) return;
+    if (!quota || !usage) return;
     const meter = quotaMeter(quota.unit === "money" ? usage.cost : usage.tokens, quota.limit);
     candidates.push({ ...meter, label, description: `${label}：${formatAmount(meter.consumed)} / ${formatAmount(meter.max)} ${unitLabel(quota.unit)}` });
   };
@@ -844,11 +844,11 @@ function totalRow() {
   const denied = draft.total_access === "deny";
   const valid = draft.period === key.policy.period && JSON.stringify(quota) === JSON.stringify(key.policy.total_quota) && draft.total_quota_enabled === key.policy.total_quota_enabled
     && (draft.total_access || "allow") === (key.policy.total_access || "allow");
-  const money = quota?.unit === "money", unpriced = money && usage?.unpriced > 0;
+  const money = quota?.unit === "money";
   const cell = usageCell();
   if (denied) cell.append(el("span", { class: "usage-note danger-text" }, "所有新请求将被拒绝"));
   else if (!valid) cell.append(el("span", { class: "usage-note" }, "保存后计算"));
-  else cell.append(...(unpriced ? [el("div", { class: "usage-text" }, "待计价")] : meterBlock(money ? usage?.cost : usage?.tokens, quota, "总额度已耗尽")),
+  else cell.append(...meterBlock(money ? usage?.cost : usage?.tokens, quota, "总额度已耗尽"),
     ...usageExtras(usage, money ? usage?.unpriced : 0, () => reviewModel("")));
   const access = accessSwitch(draft.total_access || "allow", "全部模型权限", (value) => {
     // Allowing all models needs a limit; ask for one before changing the draft.
@@ -901,8 +901,9 @@ function priceNotice(read, refresh) {
     const names = missing.slice(0, 3).join("、") + (missing.length > 3 ? " 等 " + missing.length + " 个模型" : "");
     const parts = [];
     if (missing.length) parts.push(scope === "model" ? "该模型尚未设置价格，无法保存金额额度。"
-      : names + " 尚未设置价格，金额额度下" + (missing.length > 1 ? "这些模型" : "该模型") + "的请求会被拒绝。");
-    if (unpriced) parts.push("本周期有 " + unpriced + " 条用量尚未计价，保存时需确认按当前单价补计。");
+      : names + " 尚未设置价格：请求照常放行，获得价格前不计入金额额度；"
+        + (snapshot.price_sync?.enabled ? "插件会自动同步价格，获得后补计已有用量。" : "请同步或手动设置价格，设置后补计已有用量。"));
+    if (unpriced) parts.push("本周期有 " + unpriced + " 条用量尚未计价，暂未计入金额。");
     text.textContent = parts.join("");
     node.hidden = !parts.length;
     const running = syncing || !!snapshot.price_sync?.running;
@@ -958,7 +959,7 @@ function modelRow(model) {
   const cell = usageCell();
   if (rule?.quota && usage && draft.rule_mode === key.policy.rule_mode && draft.period === key.policy.period && JSON.stringify(rule.quota) === JSON.stringify(key.policy.rules[model]?.quota)) {
     cell.append(...meterBlock(rule.quota.unit === "tokens" ? usage.tokens : usage.cost, rule.quota, "额度已耗尽"),
-      ...usageExtras(usage, usage.unpriced, () => reviewModel(model)));
+      ...usageExtras(usage, rule.quota.unit === "money" ? usage.unpriced : 0, () => reviewModel(model)));
   } else cell.append(el("span", { class: "usage-note" }, rule?.quota ? "保存后刷新周期用量" : "持续计入密钥总用量"));
   const text = rule?.quota ? "编辑额度" : "设置额度";
   const action = editButton(text, model + " " + text, { "data-quota-model": model, disabled: !key.active, onclick: () => editQuota(model) });
@@ -980,13 +981,13 @@ function channelRow(channel) {
   const cell = usageCell();
   if (!valid) cell.append(el("span", { class: "usage-note" }, "保存后刷新周期用量"));
   else {
-    if (quota && !(money && usage.unpriced)) cell.append(...meterBlock(money ? usage.cost : usage.tokens, quota, "渠道额度已耗尽"));
-    else cell.append(el("div", { class: "usage-text" }, money && usage.unpriced ? "待计价" : formatAmount(money ? usage.cost : usage.tokens) + (money ? " USD" : " Token")));
-    cell.append(...usageExtras(usage, 0, () => reviewModel("", channel.id)));
+    if (quota) cell.append(...meterBlock(money ? usage.cost : usage.tokens, quota, "渠道额度已耗尽"));
+    else cell.append(el("div", { class: "usage-text" }, formatAmount(usage.tokens) + " Token"));
+    cell.append(...usageExtras(usage, money ? usage.unpriced : 0, () => reviewModel("", channel.id)));
   }
   return el("tr", {},
     el("td", { class: "cell-scope" }, el("strong", {}, channel.label), el("details", { class: "channel-models" },
-      el("summary", {}, "渠道 · " + models.length + " 个已知模型"), el("ul", {}, models.length ? models.map((model) => el("li", {}, model.id)) : el("li", {}, "暂未发现模型，可预先配置规则")))),
+      el("summary", {}, "渠道 · " + models.length + " 个已知模型"), el("ul", {}, models.length ? models.map((model) => el("li", {}, model.id)) : el("li", {}, channel.id === "antigravity" ? "按上游 Antigravity 凭据归类，不按模型名" : "暂未发现模型")))),
     el("td", { class: "cell-access", "data-label": "权限" }, access),
     quotaCell(quota, rule?.access),
     cell,
@@ -1013,7 +1014,7 @@ function editQuota(model = null, channel = false, enableTotal = false) {
   const updateLimitWarning = () => {
     const active = !blocked && (total ? enableTotal || draft.total_quota_enabled : true);
     const used = unit === "money" ? usage?.cost : usage?.tokens;
-    const known = usage && draft.period === key.policy.period && !(unit === "money" && usage.unpriced);
+    const known = usage && draft.period === key.policy.period;
     const value = amount.input.value.trim();
     limitWarning.hidden = !active || unit === "none" || !known || value === "" || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > Number(used);
     limitWarning.textContent = "本周期已记录用量达到或超过此上限，保存后将立即拦截该额度范围的新请求。";
@@ -1041,7 +1042,8 @@ function editQuota(model = null, channel = false, enableTotal = false) {
     problem.textContent = (total ? "全部模型已禁止使用" : channel ? "该渠道已禁止调用" : "该模型当前禁止调用") + "；保存额度不会开放权限。";
     $("dialog-confirm").disabled = unavailable;
     usedText.textContent = draft.period !== key.policy.period || !usage ? "保存后计算" :
-      unit === "money" ? (usage.unpriced ? "待计价" : Number(usage.cost).toLocaleString("zh-CN", { maximumFractionDigits: 6 }) + " USD") : Number(usage.tokens).toLocaleString("zh-CN") + " Token";
+      unit === "money" ? Number(usage.cost).toLocaleString("zh-CN", { maximumFractionDigits: 6 }) + " USD" + (usage.unpriced ? "（另有 " + usage.unpriced + " 条未计价）" : "")
+        : Number(usage.tokens).toLocaleString("zh-CN") + " Token";
     updateLimitWarning();
   };
   for (const [value, label] of (total ? [["tokens", "Token"], ["money", "金额 USD"]] : [["none", "不限额"], ["tokens", "Token"], ["money", "金额 USD"]])) {
@@ -1079,8 +1081,11 @@ function addRestriction(initialScope = "channel", presetAccess = null) {
   const scopeModes = el("div", { class: "quota-modes scope-modes", role: "radiogroup", "aria-label": "限制范围" });
   const quotaModes = el("div", { class: "quota-modes", role: "radiogroup", "aria-label": "额度类型" });
   const quotaGroup = el("div", {}, el("p", { class: "field-label" }, "额度类型"), quotaModes);
-  const firstNewChannel = snapshot.channels.find((item) => !draft.channel_rules[item.id]) || snapshot.channels[0];
-  const channelSelect = dropdown(snapshot.channels.map((item) => [item.id, item.label]), firstNewChannel?.id || "other", "选择渠道");
+  // Only channels identified from known models can take new rules.
+  const selectable = snapshot.channels.filter((item) => item.identified);
+  const firstNewChannel = selectable.find((item) => !draft.channel_rules[item.id]) || selectable[0];
+  const channelSelect = dropdown(selectable.map((item) => [item.id, item.label]), firstNewChannel?.id || "", "选择渠道");
+  channelSelect.disabled = !selectable.length;
   const modelPicker = modelCombobox(snapshot.models.filter((model) => !model.targets?.length).map((model) => model.id));
   const modelInput = modelPicker.input;
   const accessSelect = accessSwitch("allow", "权限", () => update());
@@ -1154,7 +1159,9 @@ function addRestriction(initialScope = "channel", presetAccess = null) {
     amount.input.inputMode = unit === "tokens" ? "numeric" : "decimal";
     amountLabel.textContent = unit === "tokens" ? "Token 上限" : "金额上限（USD）";
     const prefix = existing() ? "该范围已有设置，本次保存会更新它。 " : "";
-    help.textContent = prefix + (scope === "all" ? (denied ? "保存后该密钥的所有新请求都会被拒绝；已设置的总额度会保留。" : "全部获准模型共享此额度。") :
+    const noChannel = scope === "channel" && !selectable.length;
+    help.textContent = noChannel ? "已知模型中还没有识别出渠道，请先点击“同步模型”。" :
+      prefix + (scope === "all" ? (denied ? "保存后该密钥的所有新请求都会被拒绝；已设置的总额度会保留。" : "全部获准模型共享此额度。") :
       denied ? "禁止规则无需额度；保存后该范围的新请求将被拒绝。" :
       unit === "none" ? "只添加允许权限，不设置独立额度。" :
       scope === "channel" ? "渠道内所有实际模型共享额度；金额按各模型价格汇总。" : "只限制这个实际模型。");
@@ -1165,7 +1172,7 @@ function addRestriction(initialScope = "channel", presetAccess = null) {
       ? "保存后将切换为按" + modeLabel(targetMode) + "限制；当前 " + Object.keys(activeRules(draft)).length + " 条" + modeLabel(draft.rule_mode) + "限制会保留但暂停。" : "";
     const { missing } = prices.render();
     const missingPrice = scope === "model" && missing.length > 0;
-    $("dialog-confirm").disabled = missingPrice;
+    $("dialog-confirm").disabled = missingPrice || noChannel;
   };
   channelSelect.onchange = loadSelection; modelInput.oninput = loadSelection;
   amount.input.addEventListener("input", () => { if (unit !== "none") amounts[unit] = amount.input.value; });
@@ -1396,10 +1403,11 @@ function editPrice(model) {
   modal("设置模型价格", [
     el("div", { class: "dialog-subject" }, el("span", { class: "model-name" }, model.id), el("span", { class: "outline-tag" }, "USD / 百万 Token")),
     grid,
-    el("p", { class: "fine" }, source + "。保存为手动价格后，自动同步不会覆盖；新价格仅影响之后放行的请求。"),
+    el("p", { class: "fine" }, source + "。保存为手动价格后，自动同步不会覆盖；新价格用于之后放行的请求，并补计该模型尚未计价的用量，已计价的费用不变。"),
   ], async () => {
     const price = Object.fromEntries(Object.entries(fields).map(([name, node]) => [name, node.value.trim() || null]));
-    await api("/price", "PUT", { model: model.id, price, revision: model.revision }); await load(true); notify("模型价格已保存");
+    const saved = await api("/price", "PUT", { model: model.id, price, revision: model.revision }); await load(true);
+    notify(saved.backfilled ? "模型价格已保存，已补计 " + saved.backfilled + " 条未计价用量" : "模型价格已保存");
   }, "保存价格", "coins");
 }
 async function reviewModel(model, channel = "") {

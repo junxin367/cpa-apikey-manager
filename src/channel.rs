@@ -1,6 +1,9 @@
-//! Product channels describe model families. Antigravity is the one upstream-based channel:
-//! it is known only after the host selects credentials, from the upstream request format.
-pub const ALL: [(&str, &str); 8] = [
+//! Channels are model families identified from model names, so a new family becomes a channel
+//! without code changes. Antigravity is the one upstream-based channel: it is known only after
+//! the host selects credentials, from the upstream request format.
+
+/// Brand spellings a capitalised ID would get wrong, plus the two channels that are not families.
+const LABELS: [(&str, &str); 8] = [
     ("gpt", "GPT"),
     ("claude", "Claude"),
     ("deepseek", "DeepSeek"),
@@ -11,14 +14,20 @@ pub const ALL: [(&str, &str); 8] = [
     ("other", "其他"),
 ];
 
-pub fn label(id: &str) -> &'static str {
-    ALL.iter()
-        .find(|(key, _)| *key == id)
-        .map_or("其他", |(_, name)| name)
+pub fn label(id: &str) -> String {
+    if let Some((_, name)) = LABELS.iter().find(|(key, _)| *key == id) {
+        return (*name).into();
+    }
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => "其他".into(),
+    }
 }
 
+/// Channel IDs are lowercase ASCII words, the shape `classify` produces.
 pub fn valid(id: &str) -> bool {
-    ALL.iter().any(|(key, _)| *key == id)
+    (2..=32).contains(&id.len()) && id.bytes().all(|c| c.is_ascii_lowercase())
 }
 
 /// A bare Kimi version root such as `k2` or `k3`.
@@ -29,39 +38,69 @@ pub fn kimi_short(root: &str) -> bool {
 
 /// Channel of one execution. `upstream_format` is the host's `ToFormat`, which is set only
 /// after credential selection; any model served by Antigravity credentials counts as Antigravity.
-pub fn resolve(model: &str, upstream_format: Option<&str>) -> &'static str {
+pub fn resolve(model: &str, upstream_format: Option<&str>) -> String {
     if upstream_format.is_some_and(|format| format.trim().eq_ignore_ascii_case("antigravity")) {
-        "antigravity"
+        "antigravity".into()
     } else {
         classify(model)
     }
 }
 
-pub fn classify(model: &str) -> &'static str {
+pub fn classify(model: &str) -> String {
     let name = model
         .rsplit('/')
         .find(|part| !part.is_empty())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let root = name.split(['-', '_', '.', ':']).next().unwrap_or("");
-    match root {
+    let mut words = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty());
+    let first = words.next().unwrap_or("");
+    // CPA exposes Kimi coding models by short names such as "k3" and "k3-256k".
+    if kimi_short(first) {
+        return "kimi".into();
+    }
+    if first.strip_prefix('o').is_some_and(|n| {
+        n.starts_with(|c: char| ('1'..='9').contains(&c)) && n.bytes().all(|c| c.is_ascii_digit())
+    }) {
+        return "gpt".into();
+    }
+    let root = letters(first);
+    let wrapped = matches!(
+        root,
+        "model" | "anthropic" | "databricks" | "us" | "eu" | "apac" | "global"
+    );
+    if let Some(family) = family(root).or_else(|| {
+        wrapped
+            .then(|| words.find_map(|word| family(letters(word))))
+            .flatten()
+    }) {
+        return family.into();
+    }
+    if valid(root) && root != "antigravity" {
+        root.into()
+    } else {
+        "other".into()
+    }
+}
+
+/// Leading letters of a word: `qwen3` is `qwen`.
+fn letters(word: &str) -> &str {
+    &word[..word
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(word.len())]
+}
+
+fn family(root: &str) -> Option<&'static str> {
+    Some(match root {
         "gpt" | "chatgpt" | "codex" => "gpt",
         "claude" => "claude",
         "deepseek" => "deepseek",
         "glm" => "glm",
         "kimi" | "moonshot" => "kimi",
         "gemini" => "gemini",
-        // CPA exposes Kimi coding models by short names such as "k3" and "k3-256k".
-        _ if kimi_short(root) => "kimi",
-        _ if root.strip_prefix('o').is_some_and(|n| {
-            n.starts_with(|c: char| ('1'..='9').contains(&c))
-                && n.bytes().all(|c| c.is_ascii_digit())
-        }) =>
-        {
-            "gpt"
-        }
-        _ => "other",
-    }
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -132,7 +171,33 @@ mod tests {
         assert_eq!(classify("kimi-k3"), "kimi");
         assert_eq!(classify("claude-opus-4-6-thinking"), "claude");
         assert_eq!(classify("gpt-image-2.5-flare"), "gpt");
-        assert_eq!(classify("kling-v2"), "other");
         assert_eq!(classify("k"), "other");
+    }
+
+    #[test]
+    fn identifies_new_families_from_model_names() {
+        for (model, family) in [
+            ("qwen3-coder-plus", "qwen"),
+            ("devin/swe-2", "swe"),
+            ("grok-code-fast-1", "grok"),
+            ("qwen3-gpt-distilled", "qwen"),
+            ("gemma-4-26b-claude-sonnet-distilled", "gemma"),
+            ("kling-v2", "kling"),
+            ("devin/model_claude_4_5_opus", "claude"),
+            ("devin/MODEL_GPT_5_2", "gpt"),
+            ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "claude"),
+            ("gpt4o", "gpt"),
+            ("o3-mini", "gpt"),
+            ("4o-mini", "other"),
+            ("x1", "other"),
+        ] {
+            assert_eq!(classify(model), family, "{model}");
+        }
+        assert_eq!(label("qwen"), "Qwen");
+        assert_eq!(label("other"), "其他");
+        assert!(valid("qwen"));
+        assert!(!valid("Qwen"));
+        assert!(!valid("q"));
+        assert!(!valid("qwen3"));
     }
 }

@@ -17,6 +17,7 @@ plugins:
       data-dir: "C:/CLIProxyAPI/data/cpa-apikey-manager"
       # 周期在管理页面按密钥设置；重置时间使用宿主服务器的系统时区。
       # 自动同步只补全未设置的价格，已有价格（包括 0 价格）不会被覆盖。
+      # 请求遇到缺价模型时会立即补查（同一模型每小时最多一次）；enabled: false 时不自动联网补查。
       price-sync:
         enabled: true
         interval-hours: 6

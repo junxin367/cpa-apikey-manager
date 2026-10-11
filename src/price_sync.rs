@@ -16,6 +16,10 @@ use std::{
 };
 
 const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
+/// How often requests for one model without a price may look it up again.
+const MISSING_RETRY: Duration = Duration::from_secs(3600);
+/// Such a lookup downloads catalogs again once they are older than this.
+const MISSING_REFRESH: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -41,9 +45,11 @@ struct Control {
     generation: u64,
     pending: bool,
     force: bool,
+    refresh: bool,
     running: bool,
     stopped: bool,
     status: Status,
+    missing: BTreeMap<String, Instant>,
 }
 type Shared = Arc<(Mutex<Control>, Condvar)>;
 struct Cached {
@@ -65,9 +71,11 @@ impl Worker {
                 config,
                 generation: 0,
                 force: false,
+                refresh: false,
                 running: false,
                 stopped: false,
                 status,
+                missing: BTreeMap::new(),
             }),
             Condvar::new(),
         ));
@@ -118,6 +126,27 @@ impl Worker {
         }
         Ok(())
     }
+    /// A request met a model without a price: look it up now instead of at the next interval.
+    pub fn request_missing(&self, model: &str) {
+        let mut control = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if control.stopped
+            || !control.config.price_sync.enabled
+            || control
+                .missing
+                .get(model)
+                .is_some_and(|asked| now.duration_since(*asked) < MISSING_RETRY)
+        {
+            return;
+        }
+        control
+            .missing
+            .retain(|_, asked| now.duration_since(*asked) < MISSING_RETRY);
+        control.missing.insert(model.to_string(), now);
+        control.pending = true;
+        control.refresh = true;
+        self.shared.1.notify_one();
+    }
     pub fn status(&self) -> Value {
         let control = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
         let mut value = serde_json::to_value(&control.status).unwrap_or_else(|_| json!({}));
@@ -145,7 +174,7 @@ fn run(shared: &Shared) {
     let mut cache = Cache::new();
     let mut next = Instant::now();
     loop {
-        let (config, generation, force, mut status) = {
+        let (config, generation, force, refresh, mut status) = {
             let mut control = shared.0.lock().unwrap_or_else(|e| e.into_inner());
             while !control.stopped && !control.pending {
                 let wait = if control.config.price_sync.enabled {
@@ -172,12 +201,19 @@ fn run(shared: &Shared) {
                 control.config.clone(),
                 control.generation,
                 std::mem::take(&mut control.force),
+                std::mem::take(&mut control.refresh),
                 control.status.clone(),
             )
         };
         if force {
             cache.clear();
         }
+        let interval = Duration::from_secs(config.price_sync.interval_hours * 3600);
+        let fresh = if refresh {
+            interval.min(MISSING_REFRESH)
+        } else {
+            interval
+        };
         let cancelled = || {
             let control = shared.0.lock().unwrap_or_else(|e| e.into_inner());
             control.stopped || control.generation != generation
@@ -185,7 +221,7 @@ fn run(shared: &Shared) {
         status.added = 0;
         status.sources.clear();
         status.error = None;
-        let result = synchronize(&config, &mut cache, &mut status, &cancelled);
+        let result = synchronize(&config, &mut cache, &mut status, &cancelled, fresh);
         if let Err(error) = result {
             status.error = Some(error);
         }
@@ -200,7 +236,7 @@ fn run(shared: &Shared) {
                 + if status.error.is_some() {
                     Duration::from_secs(300)
                 } else {
-                    Duration::from_secs(config.price_sync.interval_hours * 3600)
+                    interval
                 };
             control.status = status.clone();
         }
@@ -271,6 +307,7 @@ fn synchronize(
     cache: &mut Cache,
     status: &mut Status,
     cancelled: &impl Fn() -> bool,
+    fresh: Duration,
 ) -> Result<(), String> {
     let source_config = config::read_source(config)?;
     let mut db = Connection::open(config.data_dir.join("manager.sqlite3"))
@@ -336,7 +373,7 @@ fn synchronize(
             entry.url == *url
                 && entry.fetched.elapsed()
                     < if entry.catalog.is_ok() {
-                        Duration::from_secs(config.price_sync.interval_hours * 3600)
+                        fresh
                     } else {
                         Duration::from_secs(60)
                     }
@@ -424,6 +461,7 @@ fn synchronize(
         if inserted == 1 {
             tx.execute("INSERT INTO price_origins(model,source,source_model,synced_at) VALUES(?1,?2,?3,?4)",
                 params![model, source.name(), entry.source_model, now.to_rfc3339()]).map_err(storage)?;
+            crate::engine::backfill_unpriced(&tx, &model, &entry.price).map_err(storage)?;
             tx.execute(
                 "INSERT INTO audit(created,action,subject,detail) VALUES(?1,'price_sync',?2,?3)",
                 params![

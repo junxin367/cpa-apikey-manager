@@ -4,10 +4,38 @@ use crate::{
 };
 use chrono::Utc;
 use rusqlite::{params, Connection};
+use serde_json::Value;
+use std::collections::BTreeSet;
+
+fn v3_channel(model: &str) -> &'static str {
+    let name = model
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let root = name.split(['-', '_', '.', ':']).next().unwrap_or("");
+    match root {
+        "gpt" | "chatgpt" | "codex" => "gpt",
+        "claude" => "claude",
+        "deepseek" => "deepseek",
+        "glm" => "glm",
+        "kimi" | "moonshot" => "kimi",
+        "gemini" => "gemini",
+        _ if channel::kimi_short(root) => "kimi",
+        _ if root.strip_prefix('o').is_some_and(|n| {
+            n.starts_with(|c: char| ('1'..='9').contains(&c))
+                && n.bytes().all(|c| c.is_ascii_digit())
+        }) =>
+        {
+            "gpt"
+        }
+        _ => "other",
+    }
+}
 
 pub fn initialize(db: &mut Connection) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > 3 {
+    if version > 4 {
         return Err(Fault::new(
             503,
             "database_version_unsupported",
@@ -40,7 +68,7 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
             for model in models {
                 tx.execute(
                     &format!("UPDATE {table} SET channel=?1 WHERE model=?2"),
-                    params![channel::classify(&model), model],
+                    params![v3_channel(&model), model],
                 )?;
             }
         }
@@ -64,7 +92,7 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
                 rows.collect::<std::result::Result<Vec<_>, _>>()?
             };
             for model in models {
-                let channel = channel::classify(&model);
+                let channel = v3_channel(&model);
                 if channel != "other" {
                     tx.execute(
                         &format!(
@@ -78,6 +106,76 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
         tx.execute_batch("PRAGMA user_version=3;")?;
         tx.commit()?;
     }
+    if version < 4 {
+        // v4 identifies channels from model names, so families that fell into "other" get their
+        // own channel. Each new channel inherits a key's "other" rule, keeping existing denials
+        // and limits on those models.
+        let tx = db.transaction()?;
+        let mut split = BTreeSet::new();
+        for table in ["requests", "usage"] {
+            let models = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT DISTINCT model FROM {table} WHERE channel='other'"
+                ))?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for model in models {
+                let channel = channel::classify(&model);
+                if channel != "other" {
+                    tx.execute(
+                        &format!(
+                            "UPDATE {table} SET channel=?1 WHERE model=?2 AND channel='other'"
+                        ),
+                        params![channel, model],
+                    )?;
+                    split.insert(channel);
+                }
+            }
+        }
+        let models = {
+            let mut stmt = tx.prepare("SELECT id FROM models")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        split.extend(
+            models
+                .iter()
+                .filter(|model| v3_channel(model) == "other")
+                .map(|model| channel::classify(model))
+                .filter(|channel| channel != "other"),
+        );
+        let keys = {
+            let mut stmt = tx.prepare("SELECT id,policy FROM keys")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (id, text) in keys {
+            let mut policy: Value = serde_json::from_str(&text)?;
+            let Some(rules) = policy
+                .get_mut("channel_rules")
+                .and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            let Some(other) = rules.get("other").cloned() else {
+                continue;
+            };
+            for channel in &split {
+                rules
+                    .entry(channel.clone())
+                    .or_insert_with(|| other.clone());
+            }
+            tx.execute(
+                "UPDATE keys SET policy=?1 WHERE id=?2",
+                params![policy.to_string(), id],
+            )?;
+        }
+        tx.execute_batch("PRAGMA user_version=4;")?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -87,7 +185,7 @@ mod tests {
     use rusqlite::Connection;
 
     #[test]
-    fn v3_moves_only_name_based_other_rows() {
+    fn upgrade_moves_only_name_based_other_rows() {
         let mut db = Connection::open_in_memory().unwrap();
         initialize(&mut db).unwrap();
         let row = |rid: &str, model: &str, channel: &str| {
@@ -95,11 +193,16 @@ mod tests {
                 VALUES('{rid}','{model}','key','{model}','',0,'settled','{channel}');")
         };
         db.execute_batch(&format!(
-            "{}{}{}{}PRAGMA user_version=2;",
+            "{}{}{}{}{}INSERT INTO models(id) VALUES('qwen3-coder-plus');
+            INSERT INTO keys(id,masked,active,policy,recording_since) VALUES
+                ('limited','',1,'{{\"rule_mode\":\"channel\",\"channel_rules\":{{\"other\":{{\"access\":\"deny\"}},\"grok\":{{\"access\":\"allow\"}}}}}}',''),
+                ('open','',1,'{{\"rule_mode\":\"channel\",\"channel_rules\":{{\"gpt\":{{\"access\":\"deny\"}}}}}}','');
+            PRAGMA user_version=2;",
             row("a", "gemini-3.6-flash-high", "other"),
             row("b", "k3", "other"),
             row("c", "gemini-3.6-flash-high", "antigravity"),
             row("d", "grok-4", "other"),
+            row("e", "devin/swe-2", "other"),
         ))
         .unwrap();
         initialize(&mut db).unwrap();
@@ -114,10 +217,26 @@ mod tests {
         assert_eq!(channel("a"), "gemini");
         assert_eq!(channel("b"), "kimi");
         assert_eq!(channel("c"), "antigravity");
-        assert_eq!(channel("d"), "other");
+        assert_eq!(channel("d"), "grok");
+        assert_eq!(channel("e"), "swe");
+        let rules = |key: &str| -> serde_json::Value {
+            let text: String = db
+                .query_row("SELECT policy FROM keys WHERE id=?1", [key], |r| r.get(0))
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["channel_rules"].clone()
+        };
+        let limited = rules("limited");
+        assert_eq!(limited["swe"]["access"], "deny");
+        assert_eq!(limited["qwen"]["access"], "deny");
+        assert_eq!(
+            limited["grok"]["access"], "allow",
+            "existing rules are kept"
+        );
+        assert!(limited.get("gemini").is_none() && limited.get("kimi").is_none());
+        assert_eq!(rules("open").as_object().unwrap().len(), 1);
         let version: i64 = db
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 }

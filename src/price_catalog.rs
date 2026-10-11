@@ -42,8 +42,8 @@ fn identity(text: &str) -> String {
 }
 
 /// Reasoning-effort and thinking variants that CPA appends to a base model; they bill the same tokens.
-const VARIANT_SUFFIXES: [&str; 7] = [
-    "thinking", "high", "medium", "low", "minimal", "xhigh", "none",
+const VARIANT_SUFFIXES: [&str; 8] = [
+    "thinking", "think", "high", "medium", "low", "minimal", "xhigh", "none",
 ];
 
 fn strip_variant(name: &str) -> Option<&str> {
@@ -73,13 +73,26 @@ fn vendors(channel: &str) -> &'static [&'static str] {
     }
 }
 
-/// Base names of a host model: itself, then variants with effort/thinking suffixes removed,
-/// then "kimi-" forms of short Kimi names such as "k3".
+/// Base names of a host model: itself and the name after each routing prefix (CPA's
+/// "team/claude-x" selects a credential, not a price), each with effort/thinking suffixes
+/// removed, then "kimi-" forms of short Kimi names such as "k3".
 fn base_names(model: &str) -> Vec<String> {
-    let mut names = vec![identity(model)];
-    while let Some(next) = strip_variant(names.last().unwrap()) {
-        let next = next.to_string();
-        names.push(next);
+    let mut roots = vec![identity(model)];
+    while let Some(tail) = roots
+        .last()
+        .and_then(|name| name.split_once('/'))
+        .map(|(_, tail)| tail.to_string())
+        .filter(|tail| !tail.is_empty())
+    {
+        roots.push(tail);
+    }
+    let mut names = Vec::new();
+    for root in roots {
+        let mut name = Some(root);
+        while let Some(current) = name {
+            name = strip_variant(&current).map(str::to_string);
+            names.push(current);
+        }
     }
     let kimi: Vec<_> = names
         .iter()
@@ -93,11 +106,117 @@ fn base_names(model: &str) -> Vec<String> {
     names
 }
 
+/// Words after "claude" that do not change the base Token price. "1m" only adds a long-context
+/// surcharge, and tiered prices are not imported for any model.
+const CLAUDE_NEUTRAL: [&str; 4] = ["thinking", "think", "latest", "1m"];
+
+/// Official Anthropic spellings of a Claude name as third-party platforms write it, e.g.
+/// "claude-4.5-sonnet", "anthropic--claude-opus-4.5", "claude-opus4-6", "model_claude_4_5_opus"
+/// or "us.anthropic.claude-sonnet-4-5-20250929-v1:0". After "claude" only the family, a one- or
+/// two-part version, a snapshot date, a revision marker and neutral words are accepted; words
+/// such as "fast" or "free" may be billed differently, so those names produce nothing.
+fn claude_names(name: &str) -> Vec<String> {
+    let Some((start, _)) = name
+        .match_indices("claude")
+        .find(|(i, _)| *i == 0 || !name.as_bytes()[i - 1].is_ascii_alphanumeric())
+    else {
+        return Vec::new();
+    };
+    let mut tokens = Vec::new();
+    for word in name[start + 6..].split(|c: char| !c.is_ascii_alphanumeric()) {
+        if CLAUDE_NEUTRAL.contains(&word) {
+            continue;
+        }
+        if word.len() > 1 && word.starts_with('v') && word[1..].bytes().all(|b| b.is_ascii_digit())
+        {
+            tokens.push("v");
+            continue;
+        }
+        // "opus4" is "opus" followed by version 4.
+        let bytes = word.as_bytes();
+        let mut from = 0;
+        for i in 1..=bytes.len() {
+            if i == bytes.len() || bytes[i].is_ascii_digit() != bytes[i - 1].is_ascii_digit() {
+                tokens.push(&word[from..i]);
+                from = i;
+            }
+        }
+    }
+    let (mut family, mut version, mut date, mut revision) = (None, Vec::new(), None, false);
+    for token in tokens {
+        let digits = token.bytes().all(|b| b.is_ascii_digit());
+        if revision && digits {
+            continue; // Bedrock "-v1:0"
+        } else if token == "v" {
+            revision = true;
+        } else if digits && token.len() == 8 && !version.is_empty() && date.is_none() {
+            date = Some(token);
+        } else if digits && token.len() <= 2 && version.len() < 2 && date.is_none() {
+            version.push(token);
+        } else if !digits && family.is_none() {
+            family = Some(token);
+        } else {
+            return Vec::new();
+        }
+    }
+    let (Some(family), Some(major)) = (family, version.first()) else {
+        return Vec::new();
+    };
+    // Anthropic aliases "claude-opus-4" as "claude-opus-4-0"; 4.x+ put the family first, 3.x last.
+    let versions = match version.get(1) {
+        Some(&"0") => vec![format!("{major}-0"), major.to_string()],
+        Some(minor) => vec![format!("{major}-{minor}")],
+        None => vec![major.to_string(), format!("{major}-0")],
+    };
+    let mut names = Vec::new();
+    for suffix in date
+        .map(|d| format!("-{d}"))
+        .into_iter()
+        .chain([String::new()])
+    {
+        for v in &versions {
+            names.push(format!("claude-{family}-{v}{suffix}"));
+            names.push(format!("claude-{v}-{family}{suffix}"));
+        }
+    }
+    // OpenRouter writes versions with a dot.
+    if let Some(minor) = version.get(1) {
+        names.push(format!("claude-{family}-{major}.{minor}"));
+        names.push(format!("claude-{major}.{minor}-{family}"));
+    }
+    names
+}
+
+/// Catalogs write versions with a dot where some platforms use a dash: "gpt-5-4-mini" is
+/// "gpt-5.4-mini" and "kimi-k2-6" is "kimi-k2.6". Only the first pair of one- or two-digit
+/// numbers is joined, so dates such as "2024-05-13" keep their dashes.
+fn dotted(name: &str) -> Option<String> {
+    let parts: Vec<_> = name.split('-').collect();
+    (1..parts.len()).find_map(|i| {
+        let major = parts[i - 1].len()
+            - parts[i - 1]
+                .trim_end_matches(|c: char| c.is_ascii_digit())
+                .len();
+        let minor = parts[i];
+        ((1..=2).contains(&major)
+            && (1..=2).contains(&minor.len())
+            && minor.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| format!("{}.{}", parts[..i].join("-"), parts[i..].join("-")))
+    })
+}
+
 /// Alternative catalog identities for a host model ID, most specific first, excluding the ID itself.
 pub fn compatible_names(model: &str) -> Vec<String> {
     let original = identity(model);
     let mut names = Vec::<String>::new();
-    for base in base_names(model) {
+    let bases = base_names(model);
+    let claude: Vec<_> = bases.iter().flat_map(|base| claude_names(base)).collect();
+    let dotted: Vec<_> = bases
+        .iter()
+        .filter(|base| !base.contains('/'))
+        .filter_map(|base| dotted(base))
+        .collect();
+    for base in bases.into_iter().chain(claude).chain(dotted) {
         let mut push = |name: String| {
             if name != original && !names.contains(&name) {
                 names.push(name);
@@ -105,7 +224,7 @@ pub fn compatible_names(model: &str) -> Vec<String> {
         };
         if !base.contains('/') {
             push(base.clone());
-            for vendor in vendors(channel::classify(&base)) {
+            for vendor in vendors(&channel::classify(&base)) {
                 push(format!("{vendor}/{base}"));
             }
         } else {
@@ -496,5 +615,71 @@ mod tests {
         // Differently priced variants never stand in for an unknown base model.
         assert_eq!(pick(&catalog, "gpt-9"), None);
         assert_eq!(pick(&catalog, "qwen-max"), None);
+        // A routing prefix such as CPA's "team/model" names a credential, not a catalog provider.
+        assert_eq!(
+            pick(&catalog, "team/gemini-3.6-flash-high").as_deref(),
+            Some("gemini-3.6-flash")
+        );
+        assert_eq!(
+            pick(&catalog, "devin/k3").as_deref(),
+            Some("moonshot/kimi-k3")
+        );
+        // Dashed versions as some platforms write them.
+        assert_eq!(
+            pick(&catalog, "devin/gemini-3-6-flash-high").as_deref(),
+            Some("gemini-3.6-flash")
+        );
+    }
+
+    #[test]
+    fn third_party_claude_names_use_official_prices() {
+        let cost = |input: f64, output: f64| json!({"cost": {"input": input, "output": output}});
+        let catalog = Catalog::parse(
+            Source::ModelsDev,
+            &json!({
+                "models": {
+                    "anthropic/claude-haiku-5-5": {},
+                    "anthropic/claude-sonnet-4-5": {},
+                    "anthropic/claude-opus-4-8": {},
+                },
+                "providers": {
+                    "anthropic": {"models": {
+                        "claude-haiku-5-5": cost(0.1, 0.5),
+                        "claude-sonnet-4-5": cost(3.0, 15.0),
+                        "claude-opus-4-8": cost(5.0, 25.0),
+                    }},
+                    "venice": {"models": {"claude-opus-4-8-fast": cost(30.0, 150.0)}},
+                },
+            }),
+        )
+        .unwrap();
+        for (model, official) in [
+            ("devin/claude-haiku-5-5", "anthropic/claude-haiku-5-5"),
+            ("claude-haiku-5-5-20261007", "anthropic/claude-haiku-5-5"),
+            ("kiro/claude-sonnet-4.5", "anthropic/claude-sonnet-4-5"),
+            ("claude-4.5-sonnet", "anthropic/claude-sonnet-4-5"),
+            (
+                "anthropic--claude-4-5-sonnet",
+                "anthropic/claude-sonnet-4-5",
+            ),
+            (
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "anthropic/claude-sonnet-4-5",
+            ),
+            ("claude-opus4-8-think", "anthropic/claude-opus-4-8"),
+            ("model_claude_4_8_opus", "anthropic/claude-opus-4-8"),
+            // Long-context surcharges are not imported, so the 1M variant bills the base rates.
+            ("claude-opus-4-8-thinking-1m", "anthropic/claude-opus-4-8"),
+        ] {
+            assert_eq!(pick(&catalog, model).as_deref(), Some(official), "{model}");
+        }
+        // Speed and free tiers may be billed differently from the base model.
+        for model in [
+            "claude-opus-4-8-fast",
+            "claude-sonnet-4-5-free",
+            "gemma-4-31b-claude-4.6-opus-reasoning-distilled",
+        ] {
+            assert_eq!(pick(&catalog, model), None, "{model}");
+        }
     }
 }

@@ -11,7 +11,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    time::Duration,
+};
 
 pub type Result<T> = std::result::Result<T, Fault>;
 #[derive(Debug)]
@@ -485,20 +489,39 @@ impl Engine {
         decode_policy(&text.ok_or_else(|| Fault::new(404, "key_not_found", "密钥不存在"))?)
     }
     pub fn price(&self, model: &str) -> Result<Option<Price>> {
-        let text: Option<String> = self
-            .db
-            .query_row("SELECT price FROM prices WHERE model=?1", [model], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        text.map(|t| serde_json::from_str(&t).map_err(Fault::from))
-            .transpose()
+        stored_price(&self.db, model)
     }
     fn canonical(&self, model: &str) -> String {
         match self.aliases.get(model) {
             Some(targets) if targets.len() == 1 => targets[0].clone(),
             _ => model.to_string(),
         }
+    }
+    /// Channels of the known models, plus Antigravity once a request has run on it. Only these
+    /// can receive new channel rules.
+    fn identified_channels(&self) -> Result<BTreeSet<String>> {
+        let mut channels = BTreeSet::new();
+        let mut stmt = self.db.prepare("SELECT id FROM models")?;
+        for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            let id = id?;
+            if !self
+                .aliases
+                .get(&id)
+                .is_some_and(|targets| targets.len() > 1)
+            {
+                channels.insert(channel::classify(&self.canonical(&id)));
+            }
+        }
+        let antigravity: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM keys WHERE EXISTS(
+                SELECT 1 FROM requests WHERE requests.key_id=keys.id AND requests.channel='antigravity'))",
+            [],
+            |r| r.get(0),
+        )?;
+        if antigravity {
+            channels.insert("antigravity".into());
+        }
+        Ok(channels)
     }
     pub fn totals(&self, key: &str, model: &str, start: i64, end: i64) -> Result<Value> {
         self.scope_totals(
@@ -611,9 +634,17 @@ impl Engine {
             }
             canonical_rules.insert(model, rule.clone());
         }
+        let identified = self.identified_channels()?;
         for (id, rule) in &policy.channel_rules {
             if !channel::valid(id) {
                 return Err("未知的渠道 ID".into());
+            }
+            if !identified.contains(id) && !old.channel_rules.contains_key(id) {
+                return Err(format!(
+                    "已知模型中没有识别到渠道「{}」，请先同步模型",
+                    channel::label(id)
+                )
+                .into());
             }
             if !["allow", "deny"].contains(&rule.access.as_str()) {
                 return Err("渠道权限必须是 allow 或 deny".into());
@@ -638,22 +669,6 @@ impl Engine {
         let mut prices = BTreeMap::new();
         for scope in money_scopes {
             let filter = scope.filter();
-            let unpriced_pending: i64 = self.db.query_row(
-                &format!(
-                    "SELECT COUNT(*) FROM requests
-                WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4
-                AND price IS NULL AND status IN ('pending','review')"
-                ),
-                params![key, scope.value(), start, end],
-                |r| r.get(0),
-            )?;
-            if unpriced_pending > 0 {
-                return Err(Fault::new(
-                    409,
-                    "pending_usage",
-                    "额度范围内仍有未计价的执行中或待核对请求，处理后才能启用金额额度",
-                ));
-            }
             let mut stmt = self.db.prepare(&format!(
                 "SELECT id,model,detail FROM usage
                 WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4 AND cost IS NULL"
@@ -668,14 +683,17 @@ impl Engine {
             for row in rows {
                 let (id, actual, detail) = row?;
                 if !prices.contains_key(&actual) {
-                    let price = self.price(&actual)?.ok_or_else(|| Fault::new(
-                        409, "unpriced_usage",
-                        format!("模型「{actual}」存在未计价用量，请先在「模型价格」中补全价格，再保存金额额度。"),
-                    ))?;
-                    prices.insert(actual.clone(), price);
+                    prices.insert(actual.clone(), self.price(&actual)?);
                 }
+                // A model without a price is backfilled by its first price; incomplete Token
+                // records wait for review.
+                let Some(price) = &prices[&actual] else {
+                    continue;
+                };
                 let tokens: Tokens = serde_json::from_str(&detail)?;
-                let cost = prices[&actual].cost(&tokens)?;
+                let Ok(cost) = price.cost(&tokens) else {
+                    continue;
+                };
                 preview_cost = preview_cost.checked_add(cost).ok_or("补计总金额超出范围")?;
                 updates.push((id, cost));
             }
@@ -739,8 +757,9 @@ impl Engine {
         tx.execute("INSERT INTO prices VALUES(?1,?2,?3) ON CONFLICT(model) DO UPDATE SET price=excluded.price,revision=excluded.revision",
             params![model, serde_json::to_string(&price)?, current + 1])?;
         tx.execute("DELETE FROM price_origins WHERE model=?1", [&model])?;
+        let backfilled = backfill_unpriced(&tx, &model, &price)?;
         tx.commit()?;
-        Ok(json!({"model":model,"price":price,"revision":current+1}))
+        Ok(json!({"model":model,"price":price,"revision":current+1,"backfilled":backfilled}))
     }
     /// Internal key ID of the calling client, or `None` when the request carries no known key.
     fn caller(&self, request: &Value) -> Option<String> {
@@ -853,8 +872,8 @@ impl Engine {
             };
             for target in targets {
                 let target_channel = channel::resolve(&target, upstream);
-                if !Self::permitted(&policy, requested, &target, target_channel) {
-                    return Err(Self::denied(&policy, &target, target_channel));
+                if !Self::permitted(&policy, requested, &target, &target_channel) {
+                    return Err(Self::denied(&policy, &target, &target_channel));
                 }
             }
             return Ok(json!({}));
@@ -868,9 +887,9 @@ impl Engine {
         let upstream = if after { string(req, "ToFormat") } else { None };
         let actual_channel = channel::resolve(&actual, upstream);
         if (after || policy.rule_mode == "model")
-            && !Self::permitted(&policy, requested, &actual, actual_channel)
+            && !Self::permitted(&policy, requested, &actual, &actual_channel)
         {
-            return Err(Self::denied(&policy, &actual, actual_channel));
+            return Err(Self::denied(&policy, &actual, &actual_channel));
         }
         if !after {
             return Ok(json!({}));
@@ -904,15 +923,7 @@ impl Engine {
                     "请求被拒绝：{}有 {review} 个请求的用量待核对，无法核算额度。请在「API 密钥」对应额度区域中点击「处理待核对」。", scope.subject())));
             }
             let used = if quota.unit == "money" {
-                let unpriced = totals["unpriced"].as_i64().unwrap_or(0);
-                if unpriced > 0 {
-                    return Err(Fault::new(
-                        503,
-                        "unpriced_usage",
-                        format!("请求被拒绝：{}当前周期有 {unpriced} 条用量记录尚未计价，无法核算金额额度。请联系管理员编辑对应额度并确认补计费用后重试。",
-                            scope.subject()),
-                    ));
-                }
+                // Unpriced usage counts once its model has a price; it never blocks requests.
                 totals["cost_micros"].as_i64().unwrap_or(0)
             } else {
                 totals["tokens"]
@@ -953,7 +964,7 @@ impl Engine {
                     reset.with_timezone(&timezone).format("%Y-%m-%d %H:%M:%S")
                 );
                 let body = json!({"error":{"code":"quota_exceeded","message":message,
-                    "scope":scope.name(),"channel":actual_channel,"channel_label":channel::label(actual_channel),
+                    "scope":scope.name(),"channel":actual_channel,"channel_label":channel::label(&actual_channel),
                     "model":actual,"unit":quota.unit,"period":policy.period,
                     "used":used_text,"limit":limit_text,"reset_at":reset.to_rfc3339(),
                     "timezone":timezone_label}});
@@ -973,13 +984,10 @@ impl Engine {
             )
         })?;
         let price = self.price(&actual)?;
-        let money_required = applicable.iter().any(|(_, q)| q.unit == "money");
-        if money_required && price.is_none() {
-            return Err(Fault::new(
-                503,
-                "unpriced_usage",
-                format!("请求被拒绝：模型「{actual}」尚未设置价格，无法核算金额额度。请联系管理员在「模型价格」中设置价格后重试。"),
-            ));
+        if price.is_none() {
+            if let Some(worker) = &self.price_sync {
+                worker.request_missing(&actual);
+            }
         }
         let price = price.map(|p| serde_json::to_string(&p)).transpose()?;
         self.db.execute("INSERT OR IGNORE INTO requests(request_id,model,key_id,requested,trace_id,started,status,price,channel)
@@ -1057,12 +1065,6 @@ impl Engine {
             tokens.complete = false;
         }
         let price: Option<Price> = price.map(|p| serde_json::from_str(&p)).transpose()?;
-        let cost = price
-            .as_ref()
-            .map(|p| p.cost(&tokens))
-            .transpose()
-            .ok()
-            .flatten();
         let id = hex::encode(Sha256::digest(
             format!(
                 "{rid}\0{model}\0{}\0{}\0{}",
@@ -1072,7 +1074,10 @@ impl Engine {
             )
             .as_bytes(),
         ));
-        let tx = self.db.transaction()?;
+        // Immediate, so a price committed by the sync worker is seen before this insert.
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM usage WHERE id=?1)",
             [&id],
@@ -1081,6 +1086,17 @@ impl Engine {
         if exists {
             return Ok(());
         }
+        // An admission without a price snapshot uses the price found since then.
+        let price = match price {
+            Some(price) => Some(price),
+            None => stored_price(&tx, model)?,
+        };
+        let cost = price
+            .as_ref()
+            .map(|p| p.cost(&tokens))
+            .transpose()
+            .ok()
+            .flatten();
         // A late authoritative record replaces a manual settlement, not a second debit.
         tx.execute(
             "DELETE FROM usage WHERE request_id=?1 AND model=?2 AND manual=1",
@@ -1169,18 +1185,28 @@ impl Engine {
         let mut stmt = self
             .db
             .prepare("SELECT id,masked,active,policy,recording_since FROM keys ORDER BY rowid")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, bool>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, masked, active, p, key_recording_since) = row?;
-            let policy = decode_policy(&p)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut stored = Vec::new();
+        for (id, masked, active, p, key_recording_since) in rows {
+            stored.push((id, masked, active, decode_policy(&p)?, key_recording_since));
+        }
+        // Existing rules stay listed even when no known model belongs to their channel anymore.
+        let identified = self.identified_channels()?;
+        let mut channels = identified.clone();
+        for (_, _, _, policy, _) in &stored {
+            channels.extend(policy.channel_rules.keys().cloned());
+        }
+        for (id, masked, active, policy, key_recording_since) in stored {
             let (period_start, period_end) = accounting::period_bounds(now, zone, &policy.period)?;
             let mut total_usage = self.totals(&id, "", period_start, period_end)?;
             total_usage["reset_at"] = json!(DateTime::from_timestamp_millis(period_end)
@@ -1189,11 +1215,11 @@ impl Engine {
                 .to_rfc3339());
             let mut quotas = serde_json::Map::new();
             let mut channel_usage = serde_json::Map::new();
-            for (channel, _) in channel::ALL {
+            for channel in &channels {
                 let mut totals =
                     self.scope_totals(&id, Scope::Channel(channel), period_start, period_end)?;
                 totals["reset_at"] = total_usage["reset_at"].clone();
-                channel_usage.insert(channel.into(), totals);
+                channel_usage.insert(channel.clone(), totals);
             }
             for (model, rule) in &policy.rules {
                 if rule.quota.is_some() {
@@ -1251,7 +1277,7 @@ impl Engine {
             };
             models.push(json!({
                 "id":id,"price_model":price_model,
-                "channel":model_channel,"channel_label":model_channel.map(channel::label).unwrap_or("多渠道／待解析"),
+                "channel":model_channel,"channel_label":model_channel.as_deref().map_or_else(|| "多渠道／待解析".into(), channel::label),
                 "price":entry.map(|e| &e.0),"revision":entry.map(|e| e.1).unwrap_or(0),
                 "price_source":entry.map(|e| e.2.as_deref().unwrap_or("manual")),
                 "price_source_model":entry.and_then(|e| e.3.as_deref()),
@@ -1259,6 +1285,16 @@ impl Engine {
                 "targets":self.aliases.get(&id)
             }));
         }
+        let mut channel_list: Vec<_> = channels
+            .iter()
+            .map(|id| json!({"id":id,"label":channel::label(id),"identified":identified.contains(id)}))
+            .collect();
+        channel_list.sort_by_key(|item| {
+            (
+                item["id"] == "other",
+                item["label"].as_str().unwrap_or("").to_lowercase(),
+            )
+        });
         let recording_since: String = self.db.query_row(
             "SELECT value FROM meta WHERE name='recording_since'",
             [],
@@ -1282,7 +1318,7 @@ impl Engine {
             "enforcement_enabled":self.enforcement_enabled()?,
             "source_error":self.source_error,"health_error":self.health_error,"recording_since":recording_since,
             "review_count":reviews,"keys":keys,"models":models,
-            "channels":channel::ALL.map(|(id,label)| json!({"id":id,"label":label})),
+            "channels":channel_list,
             "continuous_recording_since":continuous_recording_since,
             "price_sync":self.price_sync.as_ref().map(|worker| worker.status()),
             "quota_mode":"settled_usage","server_time":now.to_rfc3339()}),
@@ -1490,6 +1526,46 @@ pub fn validate_model(model: &str) -> Result<()> {
         return Err("模型 ID 必须为 1～256 字节，且不含首尾空白或控制字符".into());
     }
     Ok(())
+}
+fn stored_price(db: &Connection, model: &str) -> Result<Option<Price>> {
+    let text: Option<String> = db
+        .query_row("SELECT price FROM prices WHERE model=?1", [model], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    text.map(|t| serde_json::from_str(&t).map_err(Fault::from))
+        .transpose()
+}
+/// Prices usage recorded while `model` had no price. Existing costs never change, and records
+/// with incomplete Token counts stay unpriced until reviewed.
+pub fn backfill_unpriced(db: &Connection, model: &str, price: &Price) -> rusqlite::Result<usize> {
+    let rows = {
+        let mut stmt = db.prepare("SELECT id,detail FROM usage WHERE model=?1 AND cost IS NULL")?;
+        let rows = stmt.query_map([model], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut count = 0;
+    for (id, detail) in rows {
+        let Some(cost) = serde_json::from_str::<Tokens>(&detail)
+            .ok()
+            .and_then(|tokens| price.cost(&tokens).ok())
+        else {
+            continue;
+        };
+        count += db.execute(
+            "UPDATE usage SET cost=?1 WHERE id=?2 AND cost IS NULL",
+            params![cost, id],
+        )?;
+    }
+    if count > 0 {
+        db.execute(
+            "INSERT INTO audit(created,action,subject,detail) VALUES(?1,'backfill',?2,?3)",
+            params![Utc::now().timestamp_millis(), model, count.to_string()],
+        )?;
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -1928,6 +2004,129 @@ mod key_reveal_tests {
         assert_eq!(outcome(open), Ok(json!({})));
         assert_eq!(outcome(limited), Err("key_source_unavailable"));
         assert_eq!(outcome(unknown), Err("key_source_unavailable"));
+    }
+
+    #[test]
+    fn missing_price_admits_requests_and_first_price_backfills_usage() {
+        let (mut engine, config_path) = synced_engine("sk-unpriced-test");
+        let model = "devin/claude-haiku-5-5";
+        store_policy(
+            &engine,
+            &Policy {
+                total_quota_enabled: true,
+                total_quota: Some(Quota {
+                    unit: "money".into(),
+                    limit: "1".into(),
+                }),
+                ..Policy::default()
+            },
+        );
+        let scope = crate::config::caller_scope("sk-unpriced-test");
+        let request = |id: &str| json!({"Metadata":{"caller_scope":scope},"RequestedModel":model,"Model":model,"RequestID":id});
+        let settle = |engine: &mut Engine, id: &str| {
+            engine
+                .usage(
+                    &json!({"RequestID":id,"APIKey":"sk-unpriced-test","Model":model,"Provider":"claude",
+                        "Detail":{"InputTokens":600000,"OutputTokens":0,"TotalTokens":600000}}),
+                    Utc::now(),
+                )
+                .unwrap()
+        };
+        let cost = |engine: &Engine, id: &str| -> Option<i64> {
+            engine
+                .db
+                .query_row("SELECT cost FROM usage WHERE request_id=?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+
+        // Without a price the request is admitted and recorded unpriced, which blocks nothing.
+        let now = Utc::now();
+        assert_eq!(
+            engine.intercept(&request("rid-1"), true, now).unwrap(),
+            json!({})
+        );
+        settle(&mut engine, "rid-1");
+        assert_eq!(cost(&engine, "rid-1"), None);
+        assert_eq!(
+            engine.intercept(&request("rid-2"), true, now).unwrap(),
+            json!({})
+        );
+        let key_id = engine.keys.values().next().unwrap().id.clone();
+        let mut policy = engine.policy(&key_id).unwrap();
+        policy.note = "unpriced".into();
+        engine.save_policy(&key_id, policy, false, now).unwrap();
+
+        // The first price backfills recorded usage, and an admission without a price snapshot
+        // settles with it; the money quota then counts both.
+        let price = crate::accounting::Price {
+            input: "1".into(),
+            output: "1".into(),
+            cache_read: None,
+            cache_write: None,
+        };
+        assert_eq!(engine.save_price(model, price, 0).unwrap()["backfilled"], 1);
+        assert_eq!(cost(&engine, "rid-1"), Some(600_000));
+        settle(&mut engine, "rid-2");
+        assert_eq!(cost(&engine, "rid-2"), Some(600_000));
+        let rejection = engine.intercept(&request("rid-3"), true, now).unwrap();
+        assert_eq!(rejection["StatusCode"], 429);
+
+        fs::remove_file(config_path).expect("remove source config");
+    }
+
+    #[test]
+    fn channels_come_from_known_models_and_existing_rules() {
+        let (mut engine, config_path) = synced_engine("sk-channel-list-test");
+        let key = engine.keys.values().next().unwrap().id.clone();
+        engine
+            .db
+            .execute_batch(&format!(
+                "INSERT INTO meta VALUES('recording_since','{}'),('enforcement_enabled','true');
+                 INSERT INTO models(id) VALUES('qwen3-coder-plus'),('devin/claude-opus-5-5');",
+                Utc::now().to_rfc3339()
+            ))
+            .unwrap();
+        let listed = |engine: &mut Engine| -> Vec<(String, bool)> {
+            engine.snapshot(Utc::now()).unwrap()["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| (c["id"].as_str().unwrap().into(), c["identified"] == true))
+                .collect()
+        };
+        assert_eq!(
+            listed(&mut engine),
+            [("claude".into(), true), ("qwen".into(), true)]
+        );
+        let mut policy = Policy::default();
+        policy.rule_mode = "channel".into();
+        let deny = || Rule {
+            access: "deny".into(),
+            quota: None,
+        };
+        policy.channel_rules.insert("grok".into(), deny());
+        assert_eq!(
+            engine
+                .save_policy(&key, policy.clone(), false, Utc::now())
+                .unwrap_err()
+                .message,
+            "已知模型中没有识别到渠道「Grok」，请先同步模型"
+        );
+        // A rule saved earlier stays listed and editable after its models are gone.
+        store_policy(&engine, &policy);
+        assert_eq!(
+            listed(&mut engine),
+            [
+                ("claude".into(), true),
+                ("grok".into(), false),
+                ("qwen".into(), true)
+            ]
+        );
+        policy.channel_rules.insert("qwen".into(), deny());
+        engine.save_policy(&key, policy, false, Utc::now()).unwrap();
+        fs::remove_file(config_path).ok();
     }
 
     fn synced_engine(raw_key: &str) -> (Engine, std::path::PathBuf) {
