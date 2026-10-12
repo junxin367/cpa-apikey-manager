@@ -121,8 +121,8 @@
             </div>
             <span id="price-count" class="filter-count"></span>
           </div>
-          <div class="table-scroll" tabindex="0" role="region" aria-label="模型价格表格"><table class="price-table"><thead><tr><th>模型 ID</th><th>渠道</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存读取</th><th class="num">缓存写入</th><th>计费规则</th><th>基础价格来源</th><th class="actions-head">操作</th></tr></thead><tbody id="price-rows"></tbody></table></div>
-          <p class="price-help">按 models.dev → LiteLLM → OpenRouter 补全 Token 价格，同时导入长上下文、fast/priority 等服务等级规则；基础费率一致时由后续来源补齐缺少的规则。长上下文按包含缓存的输入 Token 总数判断，超过门槛后整次执行使用对应费率。服务等级未知时按适用费率上限结算，缺少组合费率时转为待核对。旧自动价格会补齐规则，手动价格不覆盖。缺价模型仍照常放行；按张、工具、音视频等额外费用不在此范围，额度也不是严格预付费硬上限。</p>
+          <div class="table-scroll" tabindex="0" role="region" aria-label="模型价格表格"><table class="price-table"><thead><tr><th>模型 ID</th><th>渠道</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存读取</th><th class="num">缓存写入</th><th>计费规则</th><th>价格来源</th><th class="actions-head">操作</th></tr></thead><tbody id="price-rows"></tbody></table></div>
+          <p class="price-help">按 models.dev → LiteLLM → OpenRouter 补全价格，每个模型的基础费率与规则使用同一来源，不跨源补齐。自动规则仅分长上下文和服务等级两类；匹配服务等级时优先使用该等级费率，无需组合档位。服务等级未知时按适用费率上限结算。旧自动价格会更新为简化规则，手动价格和已结算费用不变。缺价模型仍照常放行；按张、工具、音视频等额外费用不在此范围，额度也不是严格预付费硬上限。</p>
         </div>
       </section>
       <section id="settings-view" class="page" hidden>

@@ -1122,12 +1122,8 @@ impl Engine {
         rid: &str,
         model: &str,
         tokens: Tokens,
-        reason: &str,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        if reason.trim().chars().count() < 4 || reason.chars().count() > 500 {
-            return Err("核对原因需填写 4～500 字".into());
-        }
         if !tokens.complete
             || [
                 tokens.input,
@@ -1173,7 +1169,7 @@ impl Engine {
         )?;
         tx.execute(
             "INSERT INTO audit(created,action,subject,detail) VALUES(?1,'settle',?2,?3)",
-            params![now.timestamp_millis(), rid, reason],
+            params![now.timestamp_millis(), rid, ""],
         )?;
         tx.commit()?;
         Ok(())
@@ -2025,7 +2021,6 @@ mod key_reveal_tests {
                     complete: true,
                     service_tier: None,
                 },
-                "本地测试核对",
                 now,
             )
             .unwrap();

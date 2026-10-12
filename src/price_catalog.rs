@@ -6,6 +6,8 @@ use crate::{
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub const RULES_VERSION: u32 = 2;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Source {
     ModelsDev,
@@ -328,7 +330,7 @@ fn parse_price(object: &Value, source: Source) -> Option<Price> {
         cache_read: optional_rate(object, reads, per_token)?,
         cache_write: optional_rate(object, writes, per_token)?,
         rules: Vec::new(),
-        rules_version: 1,
+        rules_version: RULES_VERSION,
     })
 }
 
@@ -343,7 +345,7 @@ fn rule(price: Price, input_tokens_above: Option<i64>, service_tier: Option<Stri
     }
 }
 
-fn context_rules(cost: &Value, tier: Option<&str>) -> Option<Vec<PriceRule>> {
+fn context_rules(cost: &Value) -> Option<Vec<PriceRule>> {
     let mut rules = Vec::new();
     if let Some(tiers) = cost.get("tiers").filter(|v| !v.is_null()) {
         for entry in tiers.as_array()? {
@@ -354,7 +356,7 @@ fn context_rules(cost: &Value, tier: Option<&str>) -> Option<Vec<PriceRule>> {
             rules.push(rule(
                 parse_price(entry, Source::ModelsDev)?,
                 Some(threshold),
-                tier.map(str::to_string),
+                None,
             ));
         }
     }
@@ -364,7 +366,7 @@ fn context_rules(cost: &Value, tier: Option<&str>) -> Option<Vec<PriceRule>> {
             rules.push(rule(
                 parse_price(entry, Source::ModelsDev)?,
                 Some(200_000),
-                tier.map(str::to_string),
+                None,
             ));
         }
     }
@@ -374,7 +376,7 @@ fn context_rules(cost: &Value, tier: Option<&str>) -> Option<Vec<PriceRule>> {
 fn models_dev_price(entry: &Value) -> Option<Price> {
     let cost = entry.get("cost")?;
     let mut price = parse_price(cost, Source::ModelsDev)?;
-    price.rules = context_rules(cost, None)?;
+    price.rules = context_rules(cost)?;
     if let Some(modes) = entry
         .pointer("/experimental/modes")
         .and_then(Value::as_object)
@@ -397,9 +399,8 @@ fn models_dev_price(entry: &Value) -> Option<Price> {
             price.rules.push(rule(
                 parse_price(cost, Source::ModelsDev)?,
                 None,
-                Some(tier.clone()),
+                Some(tier),
             ));
-            price.rules.extend(context_rules(cost, Some(&tier))?);
         }
     }
     price.validate().ok()?;
@@ -428,6 +429,9 @@ fn rate_condition(suffix: &str) -> Option<(Option<i64>, Option<String>)> {
         "_priority" | "_flex" | "_batches" | "_ultrafast" => service_tier(&tier[1..]),
         _ => return None,
     };
+    if threshold.is_some() && tier.is_some() {
+        return None;
+    }
     Some((threshold, tier))
 }
 
@@ -475,27 +479,6 @@ fn litellm_price(entry: &Value) -> Option<Price> {
     }
     price.validate().ok()?;
     Some(price)
-}
-
-pub fn supplement_rules(price: &mut Price, other: &Price) {
-    if price.input != other.input
-        || price.output != other.output
-        || price.cache_read != other.cache_read
-        || price.cache_write != other.cache_write
-    {
-        return;
-    }
-    for rule in &other.rules {
-        if !price.rules.iter().any(|existing| {
-            existing.input_tokens_above == rule.input_tokens_above
-                && existing.service_tier == rule.service_tier
-        }) {
-            price.rules.push(rule.clone());
-        }
-    }
-    price.rules.sort_by(|a, b| {
-        (&a.service_tier, a.input_tokens_above).cmp(&(&b.service_tier, b.input_tokens_above))
-    });
 }
 
 impl Catalog {
@@ -870,10 +853,14 @@ mod tests {
     }
 
     #[test]
-    fn imports_dynamic_litellm_context_service_and_cache_rates() {
+    fn imports_litellm_context_and_service_rules_without_combinations() {
         let price = litellm_price(&json!({
             "input_cost_per_token":1e-5, "output_cost_per_token":5e-5,
             "cache_read_input_token_cost":1e-6, "cache_creation_input_token_cost":1.25e-5,
+            "input_cost_per_token_priority":2e-5,
+            "output_cost_per_token_priority":1e-4,
+            "cache_read_input_token_cost_priority":2e-6,
+            "cache_creation_input_token_cost_priority":2.5e-5,
             "input_cost_per_token_above_272k_tokens_priority":4e-5,
             "output_cost_per_token_above_272k_tokens_priority":1.5e-4,
             "cache_read_input_token_cost_above_272k_tokens_priority":4e-6,
@@ -884,15 +871,19 @@ mod tests {
             "output_cost_per_token_batches":2.5e-5
         }))
         .unwrap();
-        let combined = price
+        let priority = price
             .rules
             .iter()
             .find(|rule| rule.service_tier.as_deref() == Some("priority"))
             .unwrap();
-        assert_eq!(combined.input_tokens_above, Some(272_000));
-        assert_eq!(combined.input, "40.000000");
-        assert_eq!(combined.cache_write.as_deref(), Some("50.000000"));
+        assert_eq!(priority.input_tokens_above, None);
+        assert_eq!(priority.input, "20.000000");
+        assert_eq!(priority.cache_write.as_deref(), Some("25.000000"));
         assert_eq!(price.rules.len(), 3);
+        assert!(price
+            .rules
+            .iter()
+            .all(|rule| { rule.input_tokens_above.is_none() || rule.service_tier.is_none() }));
         assert!(price
             .rules
             .iter()
@@ -905,20 +896,25 @@ mod tests {
     }
 
     #[test]
-    fn supplement_requires_matching_base_and_keeps_first_source_conditions() {
-        let mut first = models_dev_price(&json!({"cost":{"input":10,"output":50}})).unwrap();
-        let second = litellm_price(&json!({
-            "input_cost_per_token":1e-5, "output_cost_per_token":5e-5,
-            "input_cost_per_token_priority":2e-5, "output_cost_per_token_priority":1e-4
+    fn models_dev_service_modes_do_not_expand_into_context_combinations() {
+        let price = models_dev_price(&json!({
+            "cost":{"input":5,"output":30,"cache_read":0.5,
+                "tiers":[{"input":10,"output":45,"cache_read":1,
+                    "tier":{"type":"context","size":272000}}]},
+            "experimental":{"modes":{"fast":{
+                "cost":{"input":12.5,"output":75,"cache_read":1.25,
+                    "tiers":[{"input":25,"output":150,
+                        "tier":{"type":"context","size":272000}}]},
+                "provider":{"body":{"service_tier":"priority"}}
+            }}}
         }))
         .unwrap();
-        supplement_rules(&mut first, &second);
-        supplement_rules(&mut first, &second);
-        assert_eq!(first.rules.len(), 1);
-        let mut different = second.clone();
-        different.input = "5.000000".into();
-        different.rules[0].service_tier = Some("flex".into());
-        supplement_rules(&mut first, &different);
-        assert_eq!(first.rules.len(), 1);
+        assert_eq!(price.rules_version, RULES_VERSION);
+        assert_eq!(price.rules.len(), 2);
+        assert_eq!(price.rules[0].input_tokens_above, Some(272_000));
+        assert_eq!(price.rules[0].service_tier, None);
+        assert_eq!(price.rules[1].input_tokens_above, None);
+        assert_eq!(price.rules[1].service_tier.as_deref(), Some("priority"));
+        assert_eq!(price.rules[1].input, "12.500000");
     }
 }

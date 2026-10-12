@@ -2,7 +2,7 @@
 use crate::{
     accounting::Price,
     config::{self, Config},
-    price_catalog::{supplement_rules, Catalog, Entry, Source},
+    price_catalog::{Catalog, Entry, Source, RULES_VERSION},
 };
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -354,7 +354,9 @@ fn synchronize(
             .map_err(storage)?;
         for row in rows {
             let (model, value, revision) = row.map_err(storage)?;
-            if serde_json::from_str::<Price>(&value).is_ok_and(|price| price.rules_version < 1) {
+            if serde_json::from_str::<Price>(&value)
+                .is_ok_and(|price| price.rules_version < RULES_VERSION)
+            {
                 names.insert(model.clone());
                 upgrades.insert(model, revision);
             }
@@ -383,7 +385,7 @@ fn synchronize(
         if cancelled() {
             return Err("价格同步已取消".into());
         }
-        if missing.is_empty() && source == Source::OpenRouter {
+        if missing.is_empty() {
             continue;
         }
         let url = match source {
@@ -469,18 +471,7 @@ fn synchronize(
     if available == 0 {
         return Err("所有价格来源均不可用，已保留现有价格；稍后将自动重试，也可手动重试。".into());
     }
-    for (model, _, entry) in &mut selected {
-        for source in Source::ORDER {
-            let Some(Ok(catalog)) = cache.get(&source).map(|cached| cached.catalog.as_ref()) else {
-                continue;
-            };
-            if let Some(other) = catalog
-                .select(model)
-                .or_else(|| catalog.select_compatible(model))
-            {
-                supplement_rules(&mut entry.price, &other.price);
-            }
-        }
+    for (_, _, entry) in &selected {
         entry
             .price
             .validate()
@@ -546,10 +537,209 @@ fn synchronize(
             .map_err(storage)?;
         if found.is_none_or(|(value, automatic)| {
             automatic
-                && serde_json::from_str::<Price>(&value).is_ok_and(|price| price.rules_version < 1)
+                && serde_json::from_str::<Price>(&value)
+                    .is_ok_and(|price| price.rules_version < RULES_VERSION)
         }) {
             status.unmatched.push(model);
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn upgrades_automatic_rules_without_merging_sources_or_touching_manual_prices() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("temp")
+            .join(format!("price-sync-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = Config {
+            cpa_config_path: root.join("config.yaml"),
+            data_dir: root.clone(),
+            ..Config::default()
+        };
+        config.price_sync.openrouter_url.clear();
+        fs::write(&config.cpa_config_path, "access:\n  api-keys: []\n").unwrap();
+        let db = Connection::open(root.join("manager.sqlite3")).unwrap();
+        db.execute_batch(include_str!("schema.sql")).unwrap();
+        let primary = Catalog::parse(
+            Source::ModelsDev,
+            &json!({"openai":{"models":{"gpt-5.5":{
+                "cost":{"input":5,"output":30,"cache_read":0.5,
+                    "tiers":[{"input":10,"output":45,"cache_read":1,
+                        "tier":{"type":"context","size":272000}}]},
+                "experimental":{"modes":{"fast":{
+                    "cost":{"input":12.5,"output":75,"cache_read":1.25},
+                    "provider":{"body":{"service_tier":"priority"}}
+                }}}
+            }}}}),
+        )
+        .unwrap();
+        let fallback = Catalog::parse(
+            Source::LiteLlm,
+            &json!({
+                "gpt-5.5":{
+                    "input_cost_per_token":5e-6,"output_cost_per_token":3e-5,
+                    "cache_read_input_token_cost":5e-7,
+                    "input_cost_per_token_batches":2.5e-6,
+                    "output_cost_per_token_batches":1.5e-5,
+                    "input_cost_per_token_flex":2.5e-6,
+                    "output_cost_per_token_flex":1.5e-5,
+                    "input_cost_per_token_above_272k_tokens_batches":5e-6,
+                    "output_cost_per_token_above_272k_tokens_batches":2.25e-5
+                },
+                "fallback-only":{"input_cost_per_token":1e-6,"output_cost_per_token":2e-6}
+            }),
+        )
+        .unwrap();
+        let mut legacy = primary.select("gpt-5.5").unwrap().price.clone();
+        legacy.rules_version = 1;
+        legacy.rules.push(crate::accounting::PriceRule {
+            input_tokens_above: None,
+            service_tier: Some("batch".into()),
+            input: "2.5".into(),
+            output: "15".into(),
+            cache_read: Some("0.25".into()),
+            cache_write: None,
+        });
+        let batch = legacy.rules.last().unwrap().clone();
+        let mut flex = batch.clone();
+        flex.service_tier = Some("flex".into());
+        legacy.rules.push(flex.clone());
+        for mut combined in [batch, flex] {
+            combined.input_tokens_above = Some(272_000);
+            legacy.rules.push(combined);
+        }
+        assert_eq!(legacy.rules.len(), 6);
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        db.execute_batch(
+            "INSERT INTO models VALUES('gpt-5.5'),('manual-model'),('fallback-only');",
+        )
+        .unwrap();
+        for model in ["gpt-5.5", "manual-model"] {
+            db.execute(
+                "INSERT INTO prices VALUES(?1,?2,7)",
+                params![model, legacy_json],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "INSERT INTO price_origins VALUES('gpt-5.5','models.dev','openai/gpt-5.5','old')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO requests(request_id,model,key_id,requested,trace_id,started,status,price)
+             VALUES('settled','gpt-5.5','key','gpt-5.5','trace',0,'settled',?1)",
+            [&legacy_json],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream)
+             VALUES('settled','settled','key','gpt-5.5',0,10,123,'{}',0,0)",
+            [],
+        )
+        .unwrap();
+        let mut cache = Cache::new();
+        cache.insert(
+            Source::ModelsDev,
+            Cached {
+                url: config.price_sync.models_dev_url.clone(),
+                fetched: Instant::now(),
+                catalog: Ok(primary),
+            },
+        );
+        cache.insert(
+            Source::LiteLlm,
+            Cached {
+                url: config.price_sync.litellm_url.clone(),
+                fetched: Instant::now(),
+                catalog: Ok(fallback),
+            },
+        );
+        let mut status = Status::default();
+        synchronize(
+            &config,
+            &mut cache,
+            &mut status,
+            &|| false,
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        assert_eq!((status.added, status.updated), (1, 1));
+        let (updated, revision): (String, i64) = db
+            .query_row(
+                "SELECT price,revision FROM prices WHERE model='gpt-5.5'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let price: Price = serde_json::from_str(&updated).unwrap();
+        assert_eq!(price.rules_version, RULES_VERSION);
+        assert_eq!(price.rules.len(), 2);
+        assert!(price.rules.iter().all(|rule| {
+            rule.service_tier.is_none() || rule.service_tier.as_deref() == Some("priority")
+        }));
+        assert_eq!(revision, 8);
+        let manual: String = db
+            .query_row(
+                "SELECT price FROM prices WHERE model='manual-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(manual, legacy_json);
+        let (cost, snapshot): (i64, String) = db
+            .query_row(
+                "SELECT u.cost,r.price FROM usage u JOIN requests r ON r.request_id=u.request_id
+             WHERE u.id='settled'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cost, 123);
+        assert_eq!(snapshot, legacy_json);
+        status = Status::default();
+        synchronize(
+            &config,
+            &mut cache,
+            &mut status,
+            &|| false,
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        assert_eq!((status.added, status.updated), (0, 0));
+
+        db.execute(
+            "UPDATE prices SET price=?1 WHERE model='gpt-5.5'",
+            [&legacy_json],
+        )
+        .unwrap();
+        for cached in cache.values_mut() {
+            cached.catalog = Err("测试目录不可用".into());
+        }
+        assert!(synchronize(
+            &config,
+            &mut cache,
+            &mut status,
+            &|| false,
+            Duration::from_secs(3600),
+        )
+        .is_err());
+        let unchanged: String = db
+            .query_row(
+                "SELECT price FROM prices WHERE model='gpt-5.5'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, legacy_json);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

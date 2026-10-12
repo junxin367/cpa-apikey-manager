@@ -1351,12 +1351,12 @@ function renderPrices(preserveFocus = false) {
   document.querySelector(".price-sync-bar").classList.toggle("is-running", !!sync.running);
   $("price-sync-status").textContent = sync.running ? "正在后台补全缺失价格" : (sync.enabled ? "自动补全已开启 · 每 " + sync.interval_hours + " 小时检查" : "自动补全已关闭，可手动同步");
   const details = [];
-  if (sync.last_success) details.push("上次完成 " + date(sync.last_success) + "，新增 " + sync.added + " 个价格，补齐 " + (sync.updated || 0) + " 个旧价格规则");
+  if (sync.last_success) details.push("上次完成 " + date(sync.last_success) + "，新增 " + sync.added + " 个价格，更新 " + (sync.updated || 0) + " 个旧价格规则");
   if (sync.error) details.push(sync.error);
   else if (sync.unmatched?.length) details.push(sync.unmatched.length + " 个模型未找到唯一匹配，可手动设置");
   const errors = (sync.sources || []).filter((source) => source.error).map((source) => source.source + "：" + source.error);
   if (errors.length) details.push(errors.join("；"));
-  $("price-sync-detail").textContent = details.join("。") || "首次同步会在后台完成；旧自动价格会补齐计费规则，手动价格不会被覆盖。";
+  $("price-sync-detail").textContent = details.join("。") || "首次同步会在后台完成；旧自动价格会更新为简化规则，手动价格不会被覆盖。";
   $("price-sync-detail").classList.toggle("error", !!sync.error);
   const signature = JSON.stringify([search, filter, visible]);
   if (signature === priceRowsSignature || (preserveFocus === true && document.activeElement?.closest("#price-rows"))) return schedulePriceRefresh();
@@ -1456,7 +1456,7 @@ function editPrice(model) {
   modal("设置模型价格", [
     el("div", { class: "dialog-subject" }, el("span", { class: "model-name" }, model.id), el("span", { class: "outline-tag" }, "USD / 百万 Token")),
     base.grid,
-    el("p", { class: "fine" }, "长上下文门槛按普通输入＋缓存读取＋缓存写入判断，超过门槛后整次执行使用该规则，不只计算超出的 Token。服务等级未知时按适用费率上限计价；缺少长上下文与服务等级组合费率时转为待核对，不按低价结算。"),
+    el("p", { class: "fine" }, "长上下文门槛按普通输入＋缓存读取＋缓存写入判断，超过门槛后整次执行使用该规则。匹配到服务等级规则时优先使用该等级费率，无需另外设置组合规则；服务等级未知时按适用费率上限计价。"),
     list, add,
     el("p", { class: "fine" }, source + "。保存为手动价格后，自动同步不会覆盖；新价格用于之后放行的请求，并补计该模型尚未计价的用量，已计价的费用不变。"),
   ], async () => {
@@ -1481,13 +1481,12 @@ function settle(item, count) {
     fields[name] = el("input", { type: "number", min: "0", step: "1", max: "9000000000000000", required: true, value: "0" }); grid.append(field(label, fields[name]));
   }
   const tier = dropdown([["", "未知（按适用费率上限）"], ["standard", "标准服务"], ["priority", "fast / priority"], ["flex", "flex"], ["batch", "batch"], ["ultrafast", "ultrafast"]], "", "核对请求服务等级");
-  const reason = el("textarea", { required: true, minLength: 4, maxLength: 500, rows: 3, placeholder: "填写数据来源和核对依据" });
-  modal("处理待核对", [el("p", {}, item.model + " · 尚有 " + count + " 个请求待处理"), el("p", { class: "fine" }, "当前请求：" + item.request_id), grid, field("服务等级", tier.root), field("核对原因", reason), el("p", { class: "fine" }, "请按上游实际用量和服务等级核对；缺少组合费率时需先补齐模型价格。之后收到真实用量时，将修正人工记录。")], async () => {
+  modal("处理待核对", [el("p", {}, item.model + " · 尚有 " + count + " 个请求待处理"), el("p", { class: "fine" }, "当前请求：" + item.request_id), grid, field("服务等级", tier.root), el("p", { class: "fine" }, "请按上游实际用量和服务等级核对；缺少对应服务等级费率时需先补齐模型价格。之后收到真实用量时，将修正人工记录。")], async () => {
     const tokens = Object.fromEntries(Object.entries(fields).map(([key, node]) => [key, Number(node.value)]));
     if (Object.values(tokens).some((v) => !Number.isSafeInteger(v) || v < 0)) throw new Error("Token 必须为有效的非负整数");
     tokens.total = tokens.input + tokens.output + tokens.cache_read + tokens.cache_write; tokens.complete = true;
     tokens.service_tier = tier.value || null;
-    await api("/settle", "POST", { request_id: item.request_id, model: item.model, tokens, reason: reason.value });
+    await api("/settle", "POST", { request_id: item.request_id, model: item.model, tokens });
     await load(true); notify("已核对该请求");
   }, "确认用量并恢复", "alert");
 }

@@ -228,7 +228,6 @@ fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
                 required("request_id")?,
                 required("model")?,
                 serde_json::from_value::<Tokens>(data["tokens"].clone())?,
-                required("reason")?,
                 Utc::now(),
             )?;
             Ok(json!({"ok":true}))

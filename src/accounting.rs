@@ -163,6 +163,16 @@ pub fn normalize(d: &Detail, provider: &str, executor: &str) -> Result<Tokens> {
     } else {
         expected.max(0)
     };
+    // Anthropic-style upstreams may report total_tokens without cache creation;
+    // the itemized counts are authoritative for billing.
+    let total = if independent
+        && d.cache_creation_tokens > 0
+        && total == expected - d.cache_creation_tokens
+    {
+        expected
+    } else {
+        total
+    };
     Ok(Tokens {
         input: input.max(0),
         output,
@@ -279,9 +289,6 @@ impl Price {
             return context.map_or_else(|| self.rates(), PriceRule::rates);
         }
         let rule = select(tier).ok_or("缺少该服务等级的计费规则，请核对模型价格")?;
-        if context.is_some_and(|context| context.input_tokens_above > rule.input_tokens_above) {
-            return Err("缺少长上下文与该服务等级的组合费率，请核对模型价格".into());
-        }
         rule.rates()
     }
     pub fn cost(&self, tokens: &Tokens) -> Result<i64> {
@@ -407,12 +414,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_combination_never_falls_back_to_a_cheaper_rule() {
+    fn service_tier_rule_overrides_context_without_a_combined_rule() {
         let mut price = price();
         price.rules.pop();
+        assert_eq!(
+            price.cost(&tokens(272_001, Some("priority"))).unwrap(),
+            5_540_020
+        );
+        assert_eq!(price.cost(&tokens(272_001, None)).unwrap(), 5_540_020);
+        assert_eq!(
+            price.cost(&tokens(272_001, Some("standard"))).unwrap(),
+            5_515_020
+        );
+        price.rules.pop();
         assert!(price.cost(&tokens(272_001, Some("priority"))).is_err());
-        assert!(price.cost(&tokens(272_001, None)).is_err());
-        assert!(price.cost(&tokens(272_001, Some("standard"))).is_ok());
     }
 
     #[test]
@@ -429,5 +444,28 @@ mod tests {
         let mut incomplete = tokens(1, None);
         incomplete.total = 1;
         assert!(flat.cost(&incomplete).is_err());
+    }
+
+    #[test]
+    fn claude_total_without_cache_creation_still_completes() {
+        let detail = Detail {
+            input_tokens: 4,
+            output_tokens: 1,
+            cache_read_tokens: 558,
+            cache_creation_tokens: 109,
+            total_tokens: 563,
+            ..Detail::default()
+        };
+        let tokens = normalize(&detail, "devin", "claude").unwrap();
+        assert!(tokens.complete);
+        assert_eq!(tokens.total, 672);
+        assert_eq!(tokens.input, 4);
+        assert_eq!(tokens.cache_write, 109);
+
+        let mut broken = detail.clone();
+        broken.total_tokens = 500;
+        assert!(!normalize(&broken, "devin", "claude").unwrap().complete);
+
+        assert!(!normalize(&detail, "openai", "codex").unwrap().complete);
     }
 }
