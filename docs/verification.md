@@ -6,6 +6,17 @@
 
 所有模型推理使用本机模拟上游和临时密钥，没有调用收费模型，也未修改用户已有部署。基线价格目录同时进行了可控模拟和真实公开 GET 验证。以下分别记录新增功能和原有基线，基线宿主与浏览器结果不代表已对新版本重复验收。
 
+## v0.6.0 长上下文与服务等级计费规则
+
+- 价格新增“计费规则”：`input_tokens_above` 门槛、`service_tier`（standard／priority／flex／batch／ultrafast）与四条费率。长上下文门槛按普通输入＋缓存读取＋缓存写入判断，严格大于门槛时整次执行套用该档；同一等级取满足条件的最高门槛；缓存费率留空时沿用该档输入价。
+- 结算优先使用宿主 `ResponseServiceTier`，其次 `ServiceTier`；`default`／`standard` 归入标准服务，`fast` 视为 `priority`。宿主未报告等级或报告 `auto` 时按该上下文适用的各档取最高费用保守结算；已知非标准等级缺少对应规则，或存在长上下文规则但缺少该等级组合费率时，`cost()` 报错、请求转为待核对且不按基础低价结算，`usage_needs_review` 阻止后续受限请求，补齐费率后补计恢复。
+- 价格目录解析 models.dev `cost.tiers[].tier{type: context,size}` 与 `experimental.modes.<name>.cost`（含 `provider.body.service_tier` 与模式名兜底），仅在没有 `tiers` 时用 `context_over_200k` 兼容 200K 档；LiteLLM 按 `_above_<N>[k|m]_tokens[_tier]`、`_priority`、`_flex`、`_batches`、`_ultrafast` 动态后缀解析，缺失字段回退基础输入／输出价，`null` 值保留但不导入。基础四种费率完全一致时，后续来源补齐前一来源缺少的规则，同条件保留优先来源，不覆盖基础价。
+- 同步新增 `updated` 计数与审计字段；只对 `price_origins` 存在且 `rules_version < 1` 的自动价格做一次性升级，升级带 `revision` 与 `price_origins` 双重条件，不会覆盖并发手动保存、手动价格和零价格。`PUT /price` 在请求体省略 `rules` 时继承现有规则，且不继承 `rules_version`，兼容旧管理页客户端。
+- 35 项 `cargo test --locked --lib`、`cargo build --release --locked`、4 项 `node --test ui/credentials.test.mjs` 与 `node --check ui/app.js` 通过。
+- 隔离宿主端到端验收（CLIProxyAPI v8.0.4 与本机模拟上游，未调用收费模型）：旧自动价格升级、零价格保留、长上下文含缓存整次计价、priority 组合与返回等级优先、流式计入、额度耗尽拦截、缺组合费率转待核对并阻止后续受限请求、补计后恢复、旧客户端编辑保留规则、价格目录请求不带鉴权头。
+- 浏览器验收：价格表“计费规则”列正确显示 `>200K`、`fast/priority`、`>200K · fast/priority` 与折叠的服务等级规则；“设置模型价格”弹窗仅改基础输入价后 9 条规则全部保留；金额 6 位小数与零门槛校验、手动新增 `>272K $5/$22.50` 规则保存均通过。
+- 价格弹窗布局：基础价格改为四列，已有规则默认折叠且摘要随输入实时更新；单规则弹窗高度从 672px 降到 434px，九条规则时内容在弹窗内滚动并固定底部操作栏。同列下拉框与输入框等宽（桌面 318px），1280×720、680×820、375×812 与 1280×520 视口下无横向溢出，折叠规则中的必填、金额精度和零门槛校验会自动展开并聚焦，`Escape` 与键盘展开正常；额度编辑弹窗保持 560px 无回归。
+
 ## v0.5.2 移除密钥列表待核对标记
 
 - 密钥列表卡片及其可访问标签不再显示“待核对”计数；详情区核对操作和后台记账逻辑不变。

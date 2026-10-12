@@ -198,11 +198,20 @@ fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
                 Utc::now(),
             )
         }
-        ("PUT", "/price") => engine.save_price(
-            required("model")?,
-            serde_json::from_value::<Price>(data["price"].clone())?,
-            data["revision"].as_i64().ok_or("缺少价格版本")?,
-        ),
+        ("PUT", "/price") => {
+            let model = required("model")?;
+            let mut price = serde_json::from_value::<Price>(data["price"].clone())?;
+            if data["price"].get("rules").is_none() {
+                if let Some(current) = engine.price(model)? {
+                    price.rules = current.rules;
+                }
+            }
+            engine.save_price(
+                model,
+                price,
+                data["revision"].as_i64().ok_or("缺少价格版本")?,
+            )
+        }
         ("POST", "/sync-models") => Ok(json!({"count":engine.sync_models(required("key_id")?)?})),
         ("POST", "/sync-prices") => engine.request_price_sync(),
         ("POST", "/model") => {

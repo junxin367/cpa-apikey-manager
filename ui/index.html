@@ -121,8 +121,8 @@
             </div>
             <span id="price-count" class="filter-count"></span>
           </div>
-          <div class="table-scroll" tabindex="0" role="region" aria-label="模型价格表格"><table class="price-table"><thead><tr><th>模型 ID</th><th>渠道</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存读取</th><th class="num">缓存写入</th><th>价格来源</th><th class="actions-head">操作</th></tr></thead><tbody id="price-rows"></tbody></table></div>
-          <p class="price-help">按 models.dev → LiteLLM → OpenRouter 的顺序补全基础 Token 价格；名称不完全一致时会去掉路由前缀（如 devin/）和推理强度后缀、把第三方平台的 Claude 写法换成官方名称、把 gpt-5-4 这类版本号改成点号后再匹配，采用的来源模型可在“价格来源”列核对。缺价模型的请求照常放行，获得价格后自动补计。缓存价留空时沿用输入价；阶梯、优先级和按张等非 Token 收费需自行核对。</p>
+          <div class="table-scroll" tabindex="0" role="region" aria-label="模型价格表格"><table class="price-table"><thead><tr><th>模型 ID</th><th>渠道</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存读取</th><th class="num">缓存写入</th><th>计费规则</th><th>基础价格来源</th><th class="actions-head">操作</th></tr></thead><tbody id="price-rows"></tbody></table></div>
+          <p class="price-help">按 models.dev → LiteLLM → OpenRouter 补全 Token 价格，同时导入长上下文、fast/priority 等服务等级规则；基础费率一致时由后续来源补齐缺少的规则。长上下文按包含缓存的输入 Token 总数判断，超过门槛后整次执行使用对应费率。服务等级未知时按适用费率上限结算，缺少组合费率时转为待核对。旧自动价格会补齐规则，手动价格不覆盖。缺价模型仍照常放行；按张、工具、音视频等额外费用不在此范围，额度也不是严格预付费硬上限。</p>
         </div>
       </section>
       <section id="settings-view" class="page" hidden>

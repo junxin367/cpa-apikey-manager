@@ -100,6 +100,8 @@ pub struct Tokens {
     pub cache_write: i64,
     pub total: i64,
     pub complete: bool,
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 pub fn normalize(d: &Detail, provider: &str, executor: &str) -> Result<Tokens> {
@@ -171,6 +173,7 @@ pub fn normalize(d: &Detail, provider: &str, executor: &str) -> Result<Tokens> {
             && input >= 0
             && expected == total
             && (separate_reasoning || d.reasoning_tokens <= output),
+        service_tier: None,
     })
 }
 
@@ -182,44 +185,249 @@ pub struct Price {
     pub cache_read: Option<String>,
     #[serde(default)]
     pub cache_write: Option<String>,
+    #[serde(default)]
+    pub rules: Vec<PriceRule>,
+    #[serde(default)]
+    pub rules_version: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriceRule {
+    #[serde(default)]
+    pub input_tokens_above: Option<i64>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    pub input: String,
+    pub output: String,
+    #[serde(default)]
+    pub cache_read: Option<String>,
+    #[serde(default)]
+    pub cache_write: Option<String>,
+}
+
+pub fn service_tier(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "auto" => None,
+        "default" | "standard" => Some("standard".into()),
+        "fast" | "priority" => Some("priority".into()),
+        "batches" | "batch" => Some("batch".into()),
+        _ => Some(value),
+    }
+}
+
+fn rates(input: &str, output: &str, read: Option<&str>, write: Option<&str>) -> Result<[i64; 4]> {
+    Ok([
+        micros(input)?,
+        micros(output)?,
+        micros(read.unwrap_or(input))?,
+        micros(write.unwrap_or(input))?,
+    ])
 }
 
 impl Price {
     pub fn validate(&self) -> Result<()> {
-        for p in [
-            &self.input,
-            &self.output,
-            self.cache_read.as_ref().unwrap_or(&self.input),
-            self.cache_write.as_ref().unwrap_or(&self.input),
-        ] {
-            micros(p)?;
+        self.rates()?;
+        if self.rules.len() > 64 {
+            return Err("计费规则最多支持 64 条".into());
+        }
+        let mut conditions = std::collections::BTreeSet::new();
+        for rule in &self.rules {
+            rule.rates()?;
+            if rule
+                .input_tokens_above
+                .is_some_and(|n| n <= 0 || n > MAX_VALUE)
+                || (rule.input_tokens_above.is_none() && rule.service_tier.is_none())
+            {
+                return Err("计费规则需指定有效的输入 Token 门槛或服务等级".into());
+            }
+            if rule
+                .service_tier
+                .as_deref()
+                .is_some_and(|tier| !["priority", "flex", "batch", "ultrafast"].contains(&tier))
+            {
+                return Err("服务等级必须是 priority、flex、batch 或 ultrafast".into());
+            }
+            if !conditions.insert((rule.input_tokens_above, rule.service_tier.as_deref())) {
+                return Err("同一输入 Token 门槛和服务等级不能重复设置".into());
+            }
         }
         Ok(())
     }
+    fn rates(&self) -> Result<[i64; 4]> {
+        rates(
+            &self.input,
+            &self.output,
+            self.cache_read.as_deref(),
+            self.cache_write.as_deref(),
+        )
+    }
+    fn rates_for(&self, input: i64, tier: Option<&str>) -> Result<[i64; 4]> {
+        let select = |tier| {
+            self.rules
+                .iter()
+                .filter(|rule| {
+                    rule.service_tier.as_deref() == tier
+                        && rule
+                            .input_tokens_above
+                            .is_none_or(|threshold| input > threshold)
+                })
+                .max_by_key(|rule| rule.input_tokens_above.unwrap_or(0))
+        };
+        let context = select(None);
+        if tier.is_none() {
+            return context.map_or_else(|| self.rates(), PriceRule::rates);
+        }
+        let rule = select(tier).ok_or("缺少该服务等级的计费规则，请核对模型价格")?;
+        if context.is_some_and(|context| context.input_tokens_above > rule.input_tokens_above) {
+            return Err("缺少长上下文与该服务等级的组合费率，请核对模型价格".into());
+        }
+        rule.rates()
+    }
     pub fn cost(&self, tokens: &Tokens) -> Result<i64> {
-        if !tokens.complete {
+        let counts = [
+            tokens.input,
+            tokens.output,
+            tokens.cache_read,
+            tokens.cache_write,
+        ];
+        if !tokens.complete
+            || counts.iter().any(|n| *n < 0 || *n > MAX_VALUE)
+            || counts.iter().sum::<i64>() != tokens.total
+        {
             return Err("Token 明细不完整，无法准确计价".into());
         }
-        let buckets = [
-            (tokens.input, &self.input),
-            (tokens.output, &self.output),
-            (
-                tokens.cache_read,
-                self.cache_read.as_ref().unwrap_or(&self.input),
-            ),
-            (
-                tokens.cache_write,
-                self.cache_write.as_ref().unwrap_or(&self.input),
-            ),
-        ];
-        let mut sum = 0_i128;
-        for (count, rate) in buckets {
-            sum += i128::from(count) * i128::from(micros(rate)?);
+        let input = tokens.input + tokens.cache_read + tokens.cache_write;
+        let tier = tokens.service_tier.as_deref().and_then(service_tier);
+        let tiers = match tier.as_deref() {
+            Some("standard") => vec![None],
+            Some(tier) => vec![Some(tier)],
+            None => {
+                let mut tiers = vec![None];
+                for rule in &self.rules {
+                    if let Some(tier) = rule.service_tier.as_deref() {
+                        if !tiers.contains(&Some(tier)) {
+                            tiers.push(Some(tier));
+                        }
+                    }
+                }
+                tiers
+            }
+        };
+        let mut sum = 0;
+        for tier in tiers {
+            let rates = self.rates_for(input, tier)?;
+            let cost = counts
+                .iter()
+                .zip(rates)
+                .map(|(count, rate)| i128::from(*count) * i128::from(rate))
+                .sum();
+            // Older hosts cannot report the served tier; never assume the cheapest one.
+            sum = sum.max(cost);
         }
         let value = (sum + i128::from(SCALE) - 1) / i128::from(SCALE);
         i64::try_from(value)
             .ok()
             .filter(|v| *v <= MAX_VALUE)
             .ok_or_else(|| "费用超出范围".into())
+    }
+}
+
+impl PriceRule {
+    fn rates(&self) -> Result<[i64; 4]> {
+        rates(
+            &self.input,
+            &self.output,
+            self.cache_read.as_deref(),
+            self.cache_write.as_deref(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn price() -> Price {
+        serde_json::from_value(json!({
+            "input":"10", "output":"50", "cache_read":"1", "cache_write":"12.5",
+            "rules":[
+                {"input_tokens_above":272000, "input":"20", "output":"75", "cache_read":"2", "cache_write":"25"},
+                {"service_tier":"priority", "input":"20", "output":"100", "cache_read":"2", "cache_write":"25"},
+                {"input_tokens_above":272000, "service_tier":"priority", "input":"40", "output":"150", "cache_read":"4", "cache_write":"50"}
+            ]
+        })).unwrap()
+    }
+    fn tokens(input: i64, tier: Option<&str>) -> Tokens {
+        Tokens {
+            input,
+            output: 1_000,
+            total: input + 1_000,
+            complete: true,
+            service_tier: tier.map(str::to_string),
+            ..Tokens::default()
+        }
+    }
+
+    #[test]
+    fn context_boundary_bills_all_tokens_and_includes_cached_input() {
+        let price = price();
+        assert_eq!(
+            price.cost(&tokens(272_000, Some("default"))).unwrap(),
+            2_770_000
+        );
+        assert_eq!(
+            price.cost(&tokens(272_001, Some("standard"))).unwrap(),
+            5_515_020
+        );
+        let tokens = Tokens {
+            input: 200_000,
+            cache_read: 60_000,
+            cache_write: 12_001,
+            output: 1_000,
+            total: 273_001,
+            complete: true,
+            service_tier: Some("standard".into()),
+        };
+        assert_eq!(price.cost(&tokens).unwrap(), 4_495_025);
+    }
+
+    #[test]
+    fn served_tier_and_combined_rates_are_distinct() {
+        let price = price();
+        assert_eq!(price.cost(&tokens(1_000, Some("fast"))).unwrap(), 120_000);
+        assert_eq!(
+            price.cost(&tokens(272_001, Some("priority"))).unwrap(),
+            11_030_040
+        );
+        assert_eq!(price.cost(&tokens(1_000, None)).unwrap(), 120_000);
+        assert_eq!(price.cost(&tokens(272_001, None)).unwrap(), 11_030_040);
+        assert!(price.cost(&tokens(1_000, Some("unknown"))).is_err());
+    }
+
+    #[test]
+    fn missing_combination_never_falls_back_to_a_cheaper_rule() {
+        let mut price = price();
+        price.rules.pop();
+        assert!(price.cost(&tokens(272_001, Some("priority"))).is_err());
+        assert!(price.cost(&tokens(272_001, None)).is_err());
+        assert!(price.cost(&tokens(272_001, Some("standard"))).is_ok());
+    }
+
+    #[test]
+    fn validates_conditions_and_preserves_fixed_point_rounding() {
+        let mut price = price();
+        price.validate().unwrap();
+        price.rules.push(price.rules[0].clone());
+        assert!(price.validate().is_err());
+        price.rules.pop();
+        price.rules[0].input_tokens_above = Some(0);
+        assert!(price.validate().is_err());
+        let flat: Price = serde_json::from_value(json!({"input":"0.000001","output":"0"})).unwrap();
+        assert_eq!(flat.cost(&tokens(1, None)).unwrap(), 1);
+        let mut incomplete = tokens(1, None);
+        incomplete.total = 1;
+        assert!(flat.cost(&incomplete).is_err());
     }
 }

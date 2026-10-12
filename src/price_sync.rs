@@ -1,7 +1,8 @@
 //! A joinable background worker keeps public-price network I/O off request hooks.
 use crate::{
+    accounting::Price,
     config::{self, Config},
-    price_catalog::{Catalog, Entry, Source},
+    price_catalog::{supplement_rules, Catalog, Entry, Source},
 };
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -35,6 +36,7 @@ pub struct Status {
     pub last_attempt: Option<String>,
     pub last_success: Option<String>,
     pub added: usize,
+    pub updated: usize,
     pub unmatched: Vec<String>,
     pub sources: Vec<SourceStatus>,
     pub error: Option<String>,
@@ -219,6 +221,7 @@ fn run(shared: &Shared) {
             control.stopped || control.generation != generation
         };
         status.added = 0;
+        status.updated = 0;
         status.sources.clear();
         status.error = None;
         let result = synchronize(&config, &mut cache, &mut status, &cancelled, fresh);
@@ -335,6 +338,28 @@ fn synchronize(
         }
     }
     let mut missing = BTreeSet::new();
+    let mut upgrades = BTreeMap::new();
+    {
+        let mut query = db.prepare(
+            "SELECT p.model,p.price,p.revision FROM prices p JOIN price_origins o ON o.model=p.model"
+        ).map_err(storage)?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(storage)?;
+        for row in rows {
+            let (model, value, revision) = row.map_err(storage)?;
+            if serde_json::from_str::<Price>(&value).is_ok_and(|price| price.rules_version < 1) {
+                names.insert(model.clone());
+                upgrades.insert(model, revision);
+            }
+        }
+    }
     for model in names {
         let exists: bool = db
             .query_row(
@@ -343,7 +368,7 @@ fn synchronize(
                 |r| r.get(0),
             )
             .map_err(storage)?;
-        if !exists {
+        if !exists || upgrades.contains_key(&model) {
             missing.insert(model);
         }
     }
@@ -358,8 +383,8 @@ fn synchronize(
         if cancelled() {
             return Err("价格同步已取消".into());
         }
-        if missing.is_empty() {
-            break;
+        if missing.is_empty() && source == Source::OpenRouter {
+            continue;
         }
         let url = match source {
             Source::ModelsDev => &config.price_sync.models_dev_url,
@@ -444,22 +469,47 @@ fn synchronize(
     if available == 0 {
         return Err("所有价格来源均不可用，已保留现有价格；稍后将自动重试，也可手动重试。".into());
     }
+    for (model, _, entry) in &mut selected {
+        for source in Source::ORDER {
+            let Some(Ok(catalog)) = cache.get(&source).map(|cached| cached.catalog.as_ref()) else {
+                continue;
+            };
+            if let Some(other) = catalog
+                .select(model)
+                .or_else(|| catalog.select_compatible(model))
+            {
+                supplement_rules(&mut entry.price, &other.price);
+            }
+        }
+        entry
+            .price
+            .validate()
+            .map_err(|_| "价格目录中的计费规则无效")?;
+    }
     let now = Utc::now();
     let tx = db.transaction().map_err(storage)?;
     let mut added = 0;
+    let mut updated = 0;
     for (model, source, entry) in selected {
-        // The unique key, not an earlier read, protects concurrent manual saves.
-        let inserted = tx
-            .execute(
-                "INSERT OR IGNORE INTO prices(model,price,revision) VALUES(?1,?2,1)",
-                params![
-                    model,
-                    serde_json::to_string(&entry.price).map_err(|_| "价格数据编码失败")?
-                ],
+        let value = serde_json::to_string(&entry.price).map_err(|_| "价格数据编码失败")?;
+        // Revision and origin checks protect manual saves made during the downloads.
+        let changed = if let Some(revision) = upgrades.get(&model) {
+            tx.execute(
+                "UPDATE prices SET price=?1,revision=revision+1 WHERE model=?2 AND revision=?3
+                 AND EXISTS(SELECT 1 FROM price_origins WHERE model=?2)",
+                params![value, model, revision],
             )
-            .map_err(storage)?;
-        if inserted == 1 {
-            tx.execute("INSERT INTO price_origins(model,source,source_model,synced_at) VALUES(?1,?2,?3,?4)",
+            .map_err(storage)?
+        } else {
+            tx.execute(
+                "INSERT OR IGNORE INTO prices(model,price,revision) VALUES(?1,?2,1)",
+                params![model, value],
+            )
+            .map_err(storage)?
+        };
+        if changed == 1 {
+            tx.execute("INSERT INTO price_origins(model,source,source_model,synced_at) VALUES(?1,?2,?3,?4)
+                ON CONFLICT(model) DO UPDATE SET source=excluded.source,source_model=excluded.source_model,synced_at=excluded.synced_at",
                 params![model, source.name(), entry.source_model, now.to_rfc3339()]).map_err(storage)?;
             crate::engine::backfill_unpriced(&tx, &model, &entry.price).map_err(storage)?;
             tx.execute(
@@ -467,11 +517,15 @@ fn synchronize(
                 params![
                     now.timestamp_millis(),
                     model,
-                    json!({"source":source.name(),"source_model":entry.source_model}).to_string()
+                    json!({"source":source.name(),"source_model":entry.source_model,"rules":entry.price.rules.len(),"upgraded":upgrades.contains_key(&model)}).to_string()
                 ],
             )
             .map_err(storage)?;
-            added += 1;
+            if upgrades.contains_key(&model) {
+                updated += 1;
+            } else {
+                added += 1;
+            }
         }
     }
     if cancelled() {
@@ -479,17 +533,21 @@ fn synchronize(
     }
     tx.commit().map_err(storage)?;
     status.added = added;
+    status.updated = updated;
     status.unmatched.clear();
     for model in all_missing {
-        let found: Option<i64> = db
+        let found: Option<(String, bool)> = db
             .query_row(
-                "SELECT revision FROM prices WHERE model=?1",
+                "SELECT price,EXISTS(SELECT 1 FROM price_origins WHERE model=?1) FROM prices WHERE model=?1",
                 [&model],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(storage)?;
-        if found.is_none() {
+        if found.is_none_or(|(value, automatic)| {
+            automatic
+                && serde_json::from_str::<Price>(&value).is_ok_and(|price| price.rules_version < 1)
+        }) {
             status.unmatched.push(model);
         }
     }

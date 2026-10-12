@@ -915,7 +915,7 @@ impl Engine {
             let review = totals["review"].as_i64().unwrap_or(0);
             if review > 0 {
                 return Err(Fault::new(503, "usage_needs_review", format!(
-                    "请求被拒绝：{}有 {review} 个请求的用量待核对，无法核算额度。请在「API 密钥」对应额度区域中点击「处理待核对」。", scope.subject())));
+                    "请求被拒绝：{}有 {review} 个请求的用量或计费规则待核对，无法核算额度。请核对模型价格，并在「API 密钥」对应额度区域中点击「处理待核对」。", scope.subject())));
             }
             let used = if quota.unit == "money" {
                 // Unpriced usage counts once its model has a price; it never blocks requests.
@@ -1058,6 +1058,10 @@ impl Engine {
             string(record, "Provider").unwrap_or(""),
             string(record, "ExecutorType").unwrap_or(""),
         )?;
+        tokens.service_tier = string(record, "ResponseServiceTier")
+            .filter(|tier| !tier.trim().is_empty())
+            .or_else(|| string(record, "ServiceTier"))
+            .and_then(accounting::service_tier);
         // CPA may emit an empty detail when upstream never supplied usage. Do not
         // silently interpret an unmeasured generation as free.
         if tokens.total == 0 && !record["Failed"].as_bool().unwrap_or(false) {
@@ -1090,12 +1094,9 @@ impl Engine {
             Some(price) => Some(price),
             None => stored_price(&tx, model)?,
         };
-        let cost = price
-            .as_ref()
-            .map(|p| p.cost(&tokens))
-            .transpose()
-            .ok()
-            .flatten();
+        let priced = price.as_ref().map(|p| p.cost(&tokens)).transpose();
+        let needs_review = !tokens.complete || priced.is_err();
+        let cost = priced.ok().flatten();
         // A late authoritative record replaces a manual settlement, not a second debit.
         tx.execute(
             "DELETE FROM usage WHERE request_id=?1 AND model=?2 AND manual=1",
@@ -1107,7 +1108,7 @@ impl Engine {
         tx.execute(
             "UPDATE requests SET status=?1 WHERE request_id=?2 AND model=?3",
             params![
-                if tokens.complete { "settled" } else { "review" },
+                if needs_review { "review" } else { "settled" },
                 parent_id,
                 model
             ],
@@ -1545,23 +1546,37 @@ fn stored_price(db: &Connection, model: &str) -> Result<Option<Price>> {
 /// with incomplete Token counts stay unpriced until reviewed.
 pub fn backfill_unpriced(db: &Connection, model: &str, price: &Price) -> rusqlite::Result<usize> {
     let rows = {
-        let mut stmt = db.prepare("SELECT id,detail FROM usage WHERE model=?1 AND cost IS NULL")?;
+        let mut stmt =
+            db.prepare("SELECT id,detail,request_id FROM usage WHERE model=?1 AND cost IS NULL")?;
         let rows = stmt.query_map([model], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut count = 0;
-    for (id, detail) in rows {
-        let Some(cost) = serde_json::from_str::<Tokens>(&detail)
-            .ok()
-            .and_then(|tokens| price.cost(&tokens).ok())
-        else {
+    for (id, detail, rid) in rows {
+        let cost = serde_json::from_str::<Tokens>(&detail)
+            .map_err(|error| error.to_string())
+            .and_then(|tokens| price.cost(&tokens));
+        let Ok(cost) = cost else {
+            db.execute(
+                "UPDATE requests SET status='review' WHERE request_id=?1 AND model=?2",
+                params![rid, model],
+            )?;
             continue;
         };
         count += db.execute(
             "UPDATE usage SET cost=?1 WHERE id=?2 AND cost IS NULL",
             params![cost, id],
+        )?;
+        db.execute(
+            "UPDATE requests SET status='settled' WHERE request_id=?1 AND model=?2 AND status='review'
+             AND NOT EXISTS(SELECT 1 FROM usage WHERE request_id=?1 AND model=?2 AND cost IS NULL)",
+            params![rid, model],
         )?;
     }
     if count > 0 {
@@ -2008,6 +2023,7 @@ mod key_reveal_tests {
                     cache_write: 0,
                     total: 20,
                     complete: true,
+                    service_tier: None,
                 },
                 "本地测试核对",
                 now,
@@ -2189,6 +2205,8 @@ mod key_reveal_tests {
             output: "1".into(),
             cache_read: None,
             cache_write: None,
+            rules: Vec::new(),
+            rules_version: 0,
         };
         assert_eq!(engine.save_price(model, price, 0).unwrap()["backfilled"], 1);
         assert_eq!(cost(&engine, "rid-1"), Some(600_000));
@@ -2198,6 +2216,102 @@ mod key_reveal_tests {
         assert_eq!(rejection["StatusCode"], 429);
 
         fs::remove_file(config_path).expect("remove source config");
+    }
+
+    #[test]
+    fn served_tiers_use_price_snapshots_and_missing_rules_require_review() {
+        let raw_key = "sk-tiered-test";
+        let (mut engine, config_path) = synced_engine(raw_key);
+        let model = "gpt-6-astra";
+        store_policy(
+            &engine,
+            &Policy {
+                total_quota_enabled: true,
+                total_quota: Some(Quota {
+                    unit: "money".into(),
+                    limit: "100".into(),
+                }),
+                ..Policy::default()
+            },
+        );
+        let price: crate::accounting::Price = serde_json::from_value(json!({
+            "input":"1", "output":"2", "cache_read":"0.1",
+            "rules":[
+                {"input_tokens_above":100,"input":"2","output":"3","cache_read":"0.2"},
+                {"service_tier":"priority","input":"4","output":"8","cache_read":"0.4"},
+                {"input_tokens_above":100,"service_tier":"priority","input":"8","output":"12","cache_read":"0.8"}
+            ]
+        })).unwrap();
+        engine.save_price(model, price.clone(), 0).unwrap();
+        let scope = crate::config::caller_scope(raw_key);
+        let request = |rid: &str| {
+            json!({
+                "RequestID":rid,"Model":model,"RequestedModel":model,"Metadata":{"caller_scope":scope}
+            })
+        };
+        let record = |rid: &str, requested: &str, served: &str| {
+            json!({
+                "RequestID":rid,"APIKey":raw_key,"Model":model,"Provider":"openai",
+                "ServiceTier":requested,"ResponseServiceTier":served,
+                "Detail":{"InputTokens":250,"OutputTokens":10,"CachedTokens":50,"TotalTokens":260}
+            })
+        };
+        let now = Utc::now();
+        engine.intercept(&request("tier-1"), true, now).unwrap();
+        let flat = serde_json::from_value(json!({"input":"99","output":"99"})).unwrap();
+        engine.save_price(model, flat, 1).unwrap();
+        engine
+            .usage(&record("tier-1", "priority", "default"), now)
+            .unwrap();
+        let cost: i64 = engine
+            .db
+            .query_row(
+                "SELECT cost FROM usage WHERE request_id='tier-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cost, 440, "admitted price and served default tier win");
+
+        engine.intercept(&request("tier-2"), true, now).unwrap();
+        engine
+            .usage(&record("tier-2", "default", "priority"), now)
+            .unwrap();
+        let (cost, status): (Option<i64>, String) = engine.db.query_row(
+            "SELECT u.cost,r.status FROM usage u JOIN requests r ON r.request_id=u.request_id WHERE u.request_id='tier-2'",
+            [], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!(cost, None);
+        assert_eq!(status, "review");
+        assert_eq!(
+            engine
+                .intercept(&request("tier-3"), true, now)
+                .unwrap_err()
+                .code,
+            "usage_needs_review"
+        );
+
+        assert_eq!(engine.save_price(model, price, 2).unwrap()["backfilled"], 1);
+        let (cost, status): (i64, String) = engine.db.query_row(
+            "SELECT u.cost,r.status FROM usage u JOIN requests r ON r.request_id=u.request_id WHERE u.request_id='tier-2'",
+            [], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!(cost, 1_760);
+        assert_eq!(status, "settled");
+        assert_eq!(
+            engine.intercept(&request("tier-3"), true, now).unwrap(),
+            json!({})
+        );
+        let unchanged: i64 = engine
+            .db
+            .query_row(
+                "SELECT cost FROM usage WHERE request_id='tier-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, 440);
+        fs::remove_file(config_path).unwrap();
     }
 
     #[test]

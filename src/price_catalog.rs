@@ -1,6 +1,6 @@
 //! Public price catalogs. Only strong, unambiguous identities are auto-selected.
 use crate::{
-    accounting::{money, Price, MAX_VALUE},
+    accounting::{money, service_tier, Price, PriceRule, MAX_VALUE},
     channel,
 };
 use serde_json::Value;
@@ -106,8 +106,7 @@ fn base_names(model: &str) -> Vec<String> {
     names
 }
 
-/// Words after "claude" that do not change the base Token price. "1m" only adds a long-context
-/// surcharge, and tiered prices are not imported for any model.
+/// Words after "claude" that preserve the model identity; context surcharges are price rules.
 const CLAUDE_NEUTRAL: [&str; 4] = ["thinking", "think", "latest", "1m"];
 
 /// Official Anthropic spellings of a Claude name as third-party platforms write it, e.g.
@@ -328,7 +327,175 @@ fn parse_price(object: &Value, source: Source) -> Option<Price> {
         output: rate(object.get(output)?, per_token)?,
         cache_read: optional_rate(object, reads, per_token)?,
         cache_write: optional_rate(object, writes, per_token)?,
+        rules: Vec::new(),
+        rules_version: 1,
     })
+}
+
+fn rule(price: Price, input_tokens_above: Option<i64>, service_tier: Option<String>) -> PriceRule {
+    PriceRule {
+        input_tokens_above,
+        service_tier,
+        input: price.input,
+        output: price.output,
+        cache_read: price.cache_read,
+        cache_write: price.cache_write,
+    }
+}
+
+fn context_rules(cost: &Value, tier: Option<&str>) -> Option<Vec<PriceRule>> {
+    let mut rules = Vec::new();
+    if let Some(tiers) = cost.get("tiers").filter(|v| !v.is_null()) {
+        for entry in tiers.as_array()? {
+            if entry.pointer("/tier/type")?.as_str()? != "context" {
+                return None;
+            }
+            let threshold = entry.pointer("/tier/size")?.as_i64()?;
+            rules.push(rule(
+                parse_price(entry, Source::ModelsDev)?,
+                Some(threshold),
+                tier.map(str::to_string),
+            ));
+        }
+    }
+    // In the new catalog this legacy key also mirrors 272K tiers, so only use it without tiers.
+    if rules.is_empty() {
+        if let Some(entry) = cost.get("context_over_200k").filter(|v| !v.is_null()) {
+            rules.push(rule(
+                parse_price(entry, Source::ModelsDev)?,
+                Some(200_000),
+                tier.map(str::to_string),
+            ));
+        }
+    }
+    Some(rules)
+}
+
+fn models_dev_price(entry: &Value) -> Option<Price> {
+    let cost = entry.get("cost")?;
+    let mut price = parse_price(cost, Source::ModelsDev)?;
+    price.rules = context_rules(cost, None)?;
+    if let Some(modes) = entry
+        .pointer("/experimental/modes")
+        .and_then(Value::as_object)
+    {
+        for (name, mode) in modes {
+            let Some(cost) = mode.get("cost") else {
+                continue;
+            };
+            let tier = mode
+                .pointer("/provider/body/service_tier")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    ["fast", "priority", "flex", "ultrafast"]
+                        .contains(&name.as_str())
+                        .then_some(name.as_str())
+                });
+            let Some(tier) = tier.and_then(service_tier) else {
+                continue;
+            };
+            price.rules.push(rule(
+                parse_price(cost, Source::ModelsDev)?,
+                None,
+                Some(tier.clone()),
+            ));
+            price.rules.extend(context_rules(cost, Some(&tier))?);
+        }
+    }
+    price.validate().ok()?;
+    Some(price)
+}
+
+fn rate_condition(suffix: &str) -> Option<(Option<i64>, Option<String>)> {
+    let (threshold, tier) = if let Some(context) = suffix.strip_prefix("_above_") {
+        let (size, tier) = context.split_once("_tokens")?;
+        let (digits, multiplier) = if let Some(size) = size.strip_suffix('k') {
+            (size, 1_000)
+        } else if let Some(size) = size.strip_suffix('m') {
+            (size, 1_000_000)
+        } else {
+            (size, 1)
+        };
+        (
+            Some(digits.parse::<i64>().ok()?.checked_mul(multiplier)?),
+            tier,
+        )
+    } else {
+        (None, suffix)
+    };
+    let tier = match tier {
+        "" if threshold.is_some() => None,
+        "_priority" | "_flex" | "_batches" | "_ultrafast" => service_tier(&tier[1..]),
+        _ => return None,
+    };
+    Some((threshold, tier))
+}
+
+fn litellm_price(entry: &Value) -> Option<Price> {
+    let mut price = parse_price(entry, Source::LiteLlm)?;
+    let fields = [
+        "input_cost_per_token",
+        "output_cost_per_token",
+        "cache_read_input_token_cost",
+        "cache_creation_input_token_cost",
+    ];
+    let mut suffixes = std::collections::BTreeSet::new();
+    for name in entry.as_object()?.keys() {
+        for field in fields {
+            if let Some(suffix) = name.strip_prefix(field) {
+                if rate_condition(suffix).is_some() {
+                    suffixes.insert(suffix);
+                }
+            }
+        }
+    }
+    for suffix in suffixes {
+        let (threshold, tier) = rate_condition(suffix)?;
+        let mut adjusted = serde_json::Map::new();
+        for field in fields {
+            adjusted.insert(
+                field.into(),
+                entry
+                    .get(format!("{field}{suffix}"))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if ["input_cost_per_token", "output_cost_per_token"].contains(&field) {
+                            entry[field].clone()
+                        } else {
+                            Value::Null
+                        }
+                    }),
+            );
+        }
+        price.rules.push(rule(
+            parse_price(&Value::Object(adjusted), Source::LiteLlm)?,
+            threshold,
+            tier,
+        ));
+    }
+    price.validate().ok()?;
+    Some(price)
+}
+
+pub fn supplement_rules(price: &mut Price, other: &Price) {
+    if price.input != other.input
+        || price.output != other.output
+        || price.cache_read != other.cache_read
+        || price.cache_write != other.cache_write
+    {
+        return;
+    }
+    for rule in &other.rules {
+        if !price.rules.iter().any(|existing| {
+            existing.input_tokens_above == rule.input_tokens_above
+                && existing.service_tier == rule.service_tier
+        }) {
+            price.rules.push(rule.clone());
+        }
+    }
+    price.rules.sort_by(|a, b| {
+        (&a.service_tier, a.input_tokens_above).cmp(&(&b.service_tier, b.input_tokens_above))
+    });
 }
 
 impl Catalog {
@@ -383,8 +550,7 @@ impl Catalog {
                         {
                             continue;
                         }
-                        if let Some(price) = entry.get("cost").and_then(|v| parse_price(v, source))
-                        {
+                        if let Some(price) = models_dev_price(entry) {
                             catalog.entries.push(Entry {
                                 source_model: format!("{provider}/{model}"),
                                 model: model.clone(),
@@ -417,7 +583,7 @@ impl Catalog {
                     } else {
                         entry
                     };
-                    if let Some(price) = parse_price(entry, source) {
+                    if let Some(price) = litellm_price(entry) {
                         catalog.entries.push(Entry {
                             source_model: model.clone(),
                             model: model.clone(),
@@ -668,7 +834,7 @@ mod tests {
             ),
             ("claude-opus4-8-think", "anthropic/claude-opus-4-8"),
             ("model_claude_4_8_opus", "anthropic/claude-opus-4-8"),
-            // Long-context surcharges are not imported, so the 1M variant bills the base rates.
+            // The 1M suffix keeps the identity; the price carries any context surcharge.
             ("claude-opus-4-8-thinking-1m", "anthropic/claude-opus-4-8"),
         ] {
             assert_eq!(pick(&catalog, model).as_deref(), Some(official), "{model}");
@@ -681,5 +847,78 @@ mod tests {
         ] {
             assert_eq!(pick(&catalog, model), None, "{model}");
         }
+    }
+
+    #[test]
+    fn imports_catalog_context_threshold_and_fast_mode_without_legacy_double_counting() {
+        let entry = json!({
+            "cost":{
+                "input":10, "output":50, "cache_read":1,
+                "tiers":[{"input":20,"output":75,"cache_read":2,"tier":{"type":"context","size":272000}}],
+                "context_over_200k":{"input":20,"output":75,"cache_read":2}
+            },
+            "experimental":{"modes":{"fast":{
+                "cost":{"input":20,"output":100,"cache_read":2},
+                "provider":{"body":{"service_tier":"priority"}}
+            }}}
+        });
+        let price = models_dev_price(&entry).unwrap();
+        assert_eq!(price.rules.len(), 2);
+        assert_eq!(price.rules[0].input_tokens_above, Some(272_000));
+        assert_eq!(price.rules[1].service_tier.as_deref(), Some("priority"));
+        assert_eq!(price.rules[1].output, "100.000000");
+    }
+
+    #[test]
+    fn imports_dynamic_litellm_context_service_and_cache_rates() {
+        let price = litellm_price(&json!({
+            "input_cost_per_token":1e-5, "output_cost_per_token":5e-5,
+            "cache_read_input_token_cost":1e-6, "cache_creation_input_token_cost":1.25e-5,
+            "input_cost_per_token_above_272k_tokens_priority":4e-5,
+            "output_cost_per_token_above_272k_tokens_priority":1.5e-4,
+            "cache_read_input_token_cost_above_272k_tokens_priority":4e-6,
+            "cache_creation_input_token_cost_above_272k_tokens_priority":5e-5,
+            "input_cost_per_token_above_128k_tokens":2e-5,
+            "output_cost_per_token_above_128k_tokens":7.5e-5,
+            "input_cost_per_token_batches":5e-6,
+            "output_cost_per_token_batches":2.5e-5
+        }))
+        .unwrap();
+        let combined = price
+            .rules
+            .iter()
+            .find(|rule| rule.service_tier.as_deref() == Some("priority"))
+            .unwrap();
+        assert_eq!(combined.input_tokens_above, Some(272_000));
+        assert_eq!(combined.input, "40.000000");
+        assert_eq!(combined.cache_write.as_deref(), Some("50.000000"));
+        assert_eq!(price.rules.len(), 3);
+        assert!(price
+            .rules
+            .iter()
+            .any(|rule| rule.service_tier.as_deref() == Some("batch")));
+        assert!(litellm_price(&json!({
+            "input_cost_per_token":1e-5, "output_cost_per_token":5e-5,
+            "input_cost_per_token_priority":"invalid"
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn supplement_requires_matching_base_and_keeps_first_source_conditions() {
+        let mut first = models_dev_price(&json!({"cost":{"input":10,"output":50}})).unwrap();
+        let second = litellm_price(&json!({
+            "input_cost_per_token":1e-5, "output_cost_per_token":5e-5,
+            "input_cost_per_token_priority":2e-5, "output_cost_per_token_priority":1e-4
+        }))
+        .unwrap();
+        supplement_rules(&mut first, &second);
+        supplement_rules(&mut first, &second);
+        assert_eq!(first.rules.len(), 1);
+        let mut different = second.clone();
+        different.input = "5.000000".into();
+        different.rules[0].service_tier = Some("flex".into());
+        supplement_rules(&mut first, &different);
+        assert_eq!(first.rules.len(), 1);
     }
 }

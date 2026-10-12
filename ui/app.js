@@ -461,6 +461,10 @@ function validateNumber(input) {
   input.setAttribute("aria-invalid", String(!!problem));
   const message = $(input.getAttribute("aria-describedby"));
   if (message) { message.textContent = problem; message.hidden = !problem; }
+  if (problem) {
+    const card = input.closest("details.price-rule-card");
+    if (card) card.open = true;
+  }
   return !problem;
 }
 function date(value, time = true, seconds = true) {
@@ -1309,6 +1313,24 @@ function priceText(value) {
   const [whole, fraction = ""] = String(value).split(".");
   return whole + "." + fraction.replace(/0+$/, "").padEnd(2, "0");
 }
+function priceRuleLabel(rule) {
+  const threshold = rule.input_tokens_above;
+  const context = threshold == null ? "" : ">" + (threshold % 1000 === 0 ? threshold / 1000 + "K" : formatAmount(threshold));
+  const tier = rule.service_tier === "priority" ? "fast/priority" : rule.service_tier || "";
+  return [context, tier].filter(Boolean).join(" · ");
+}
+function priceRules(price) {
+  if (!price) return el("span", { class: "muted" }, "—");
+  if (!price.rules?.length) return el("span", { class: "muted" }, "基础费率");
+  const badge = (rule) => el("span", {
+    class: "price-rule",
+    title: "USD / 百万 Token · 输入 " + rule.input + " · 输出 " + rule.output + " · 缓存读取 " + (rule.cache_read ?? rule.input) + " · 缓存写入 " + (rule.cache_write ?? rule.input),
+  }, el("strong", {}, priceRuleLabel(rule)), el("span", {}, "$" + priceText(rule.input) + " / $" + priceText(rule.output)));
+  const primary = price.rules.filter((rule) => !rule.service_tier || rule.service_tier === "priority");
+  const others = price.rules.filter((rule) => rule.service_tier && rule.service_tier !== "priority");
+  return el("div", { class: "price-rules" }, primary.map(badge), others.length ? el("details", {},
+    el("summary", {}, "另 " + others.length + " 条服务等级规则"), el("div", { class: "price-rules" }, others.map(badge))) : null);
+}
 function renderPrices(preserveFocus = false) {
   const models = snapshot.models.filter((m) => !m.targets?.length);
   const search = $("price-search").value.trim().toLowerCase(), filter = priceFilter;
@@ -1329,12 +1351,12 @@ function renderPrices(preserveFocus = false) {
   document.querySelector(".price-sync-bar").classList.toggle("is-running", !!sync.running);
   $("price-sync-status").textContent = sync.running ? "正在后台补全缺失价格" : (sync.enabled ? "自动补全已开启 · 每 " + sync.interval_hours + " 小时检查" : "自动补全已关闭，可手动同步");
   const details = [];
-  if (sync.last_success) details.push("上次完成 " + date(sync.last_success) + "，新增 " + sync.added + " 个价格");
+  if (sync.last_success) details.push("上次完成 " + date(sync.last_success) + "，新增 " + sync.added + " 个价格，补齐 " + (sync.updated || 0) + " 个旧价格规则");
   if (sync.error) details.push(sync.error);
   else if (sync.unmatched?.length) details.push(sync.unmatched.length + " 个模型未找到唯一匹配，可手动设置");
   const errors = (sync.sources || []).filter((source) => source.error).map((source) => source.source + "：" + source.error);
   if (errors.length) details.push(errors.join("；"));
-  $("price-sync-detail").textContent = details.join("。") || "首次同步会在后台完成，已设置的价格不会被覆盖。";
+  $("price-sync-detail").textContent = details.join("。") || "首次同步会在后台完成；旧自动价格会补齐计费规则，手动价格不会被覆盖。";
   $("price-sync-detail").classList.toggle("error", !!sync.error);
   const signature = JSON.stringify([search, filter, visible]);
   if (signature === priceRowsSignature || (preserveFocus === true && document.activeElement?.closest("#price-rows"))) return schedulePriceRefresh();
@@ -1346,13 +1368,14 @@ function renderPrices(preserveFocus = false) {
       const value = model.price ? priceText(model.price[name]) : null;
       return el("td", { class: "price-value num" + (value ? "" : " muted"), title: model.price?.[name] ?? "" }, value ?? (model.price ? "沿用输入" : "—"));
     }),
+    el("td", { class: "price-rule-cell" }, priceRules(model.price)),
     el("td", {}, el("span", { class: "price-source" },
       el("span", { class: "badge" + (!model.price ? " warn" : model.price_source === "manual" ? " info" : "") }, model.price_source === "manual" ? "手动设置" : (model.price_source || "待设置")),
       model.price_synced_at ? el("small", { class: "price-origin", title: model.price_source_model || "" }, date(model.price_synced_at, false)) : null)),
     el("td", { class: "cell-actions" }, el("div", { class: "row-actions" },
       el("button", { class: (model.price ? "secondary" : "primary") + " small", type: "button", "data-model": model.id, onclick: () => editPrice(model) },
         icon(model.price ? "pencil" : "plus"), model.price ? "编辑" : "设置价格"))))));
-  if (!visible.length) $("price-rows").append(el("tr", {}, el("td", { colSpan: 8, class: "empty compact" },
+  if (!visible.length) $("price-rows").append(el("tr", {}, el("td", { colSpan: 9, class: "empty compact" },
     icon("models"), el("h2", {}, models.length ? "没有匹配的价格" : "暂无模型"),
     el("p", {}, models.length ? "调整模型名称或价格状态后重试。" : "请先在 API 密钥页面同步或添加模型。"),
     models.length ? el("button", { class: "secondary", onclick: () => { $("price-search").value = ""; priceFilter = "all"; renderPrices(); } }, "清除筛选") : null)));
@@ -1391,21 +1414,58 @@ $("sync-prices").onclick = () => guard(async () => {
 });
 function editPrice(model) {
   model = snapshot.models.find((item) => item.id === model.id) || model;
-  const fields = {};
-  const grid = el("div", { class: "field-grid" });
-  for (const [name, label] of [["input", "输入"], ["output", "输出"], ["cache_read", "缓存读取"], ["cache_write", "缓存写入"]]) {
-    const required = ["input", "output"].includes(name);
-    const control = numericField({ inputMode: "decimal", value: model.price?.[name] || "", required, "aria-label": label + "价（USD / 百万 Token）", placeholder: required ? "必填，例如 1.25" : "留空沿用输入价" }, "money", !required);
-    fields[name] = control.input;
-    grid.append(field(label + "价", el("div", {}, control.input, control.message)));
+  const priceFields = (price = {}, prefix = "") => {
+    const fields = {}, grid = el("div", { class: "field-grid price-fields" });
+    for (const [name, label] of [["input", "输入"], ["output", "输出"], ["cache_read", "缓存读取"], ["cache_write", "缓存写入"]]) {
+      const required = ["input", "output"].includes(name);
+      const control = numericField({ inputMode: "decimal", value: price?.[name] || "", required, "aria-label": prefix + label + "价（USD / 百万 Token）", placeholder: required ? "必填，例如 1.25" : "留空沿用输入价" }, "money", !required);
+      fields[name] = control.input;
+      grid.append(field(label + "价", el("div", {}, control.input, control.message)));
+    }
+    return { grid, read: () => Object.fromEntries(Object.entries(fields).map(([name, node]) => [name, node.value.trim() || null])) };
+  };
+  const base = priceFields(model.price);
+  const rules = [], list = el("div", { class: "price-rule-editor" });
+  const add = el("button", { class: "secondary small", type: "button", onclick: () => addRule() }, icon("plus"), "添加计费规则");
+  function addRule(value = {}, open = true) {
+    if (rules.length >= 64) return;
+    const threshold = numericField({ value: value.input_tokens_above ?? "", inputMode: "numeric", placeholder: "留空表示不限制", "aria-label": "输入 Token 大于" }, "tokens", true);
+    const tier = dropdown([["", "标准服务"], ["priority", "fast / priority"], ["flex", "flex"], ["batch", "batch"], ["ultrafast", "ultrafast"]], value.service_tier || "", "计费规则服务等级");
+    const prices = priceFields(value, "规则");
+    const card = el("details", { class: "price-rule-card", open });
+    const label = el("strong"), rates = el("span", { class: "price-rule-rates" });
+    const entry = { card, threshold: threshold.input, read: () => ({ ...prices.read(), input_tokens_above: threshold.input.value.trim() ? Number(threshold.input.value) : null, service_tier: tier.value || null }) };
+    const summarize = () => {
+      const rule = entry.read();
+      label.textContent = priceRuleLabel(rule) || "新计费规则";
+      rates.textContent = "输入 " + (rule.input ? "$" + priceText(rule.input) : "待填写") + " · 输出 " + (rule.output ? "$" + priceText(rule.output) : "待填写");
+    };
+    card.addEventListener("input", summarize);
+    card.addEventListener("invalid", () => { card.open = true; }, true);
+    tier.onchange = summarize;
+    card.append(el("summary", { class: "price-rule-summary" }, icon("chevronDown"), label, rates),
+    el("div", { class: "price-rule-body" }, el("div", { class: "price-rule-heading" }, el("span", { class: "fine" }, "规则条件与费率"), el("button", { class: "ghost small", type: "button", "aria-label": "删除计费规则", onclick: () => {
+      rules.splice(rules.indexOf(entry), 1); card.remove(); add.disabled = false;
+    } }, icon("trash"), "删除")),
+    el("div", { class: "field-grid" }, field("输入 Token 大于", el("div", {}, threshold.input, threshold.message)), field("服务等级", tier.root)), prices.grid));
+    summarize();
+    rules.push(entry); list.append(card); add.disabled = rules.length >= 64;
   }
+  for (const rule of model.price?.rules || []) addRule(rule, false);
   const source = model.price_source === "manual" ? "当前为手动价格" : model.price_source ? "当前来自 " + model.price_source : "尚未设置价格";
   modal("设置模型价格", [
     el("div", { class: "dialog-subject" }, el("span", { class: "model-name" }, model.id), el("span", { class: "outline-tag" }, "USD / 百万 Token")),
-    grid,
+    base.grid,
+    el("p", { class: "fine" }, "长上下文门槛按普通输入＋缓存读取＋缓存写入判断，超过门槛后整次执行使用该规则，不只计算超出的 Token。服务等级未知时按适用费率上限计价；缺少长上下文与服务等级组合费率时转为待核对，不按低价结算。"),
+    list, add,
     el("p", { class: "fine" }, source + "。保存为手动价格后，自动同步不会覆盖；新价格用于之后放行的请求，并补计该模型尚未计价的用量，已计价的费用不变。"),
   ], async () => {
-    const price = Object.fromEntries(Object.entries(fields).map(([name, node]) => [name, node.value.trim() || null]));
+    const price = { ...base.read(), rules: rules.map((rule) => rule.read()), rules_version: 1 };
+    const invalid = price.rules.findIndex((rule) => rule.input_tokens_above === 0 || (!rule.input_tokens_above && !rule.service_tier));
+    if (invalid >= 0) {
+      rules[invalid].card.open = true; rules[invalid].threshold.focus();
+      throw new Error("计费规则需指定大于 0 的输入 Token 门槛或服务等级");
+    }
     const saved = await api("/price", "PUT", { model: model.id, price, revision: model.revision }); await load(true);
     notify(saved.backfilled ? "模型价格已保存，已补计 " + saved.backfilled + " 条未计价用量" : "模型价格已保存");
   }, "保存价格", "coins");
@@ -1420,11 +1480,13 @@ function settle(item, count) {
   for (const [name, label] of [["input", "普通输入 Token"], ["output", "输出 Token"], ["cache_read", "缓存读取 Token"], ["cache_write", "缓存写入 Token"]]) {
     fields[name] = el("input", { type: "number", min: "0", step: "1", max: "9000000000000000", required: true, value: "0" }); grid.append(field(label, fields[name]));
   }
+  const tier = dropdown([["", "未知（按适用费率上限）"], ["standard", "标准服务"], ["priority", "fast / priority"], ["flex", "flex"], ["batch", "batch"], ["ultrafast", "ultrafast"]], "", "核对请求服务等级");
   const reason = el("textarea", { required: true, minLength: 4, maxLength: 500, rows: 3, placeholder: "填写数据来源和核对依据" });
-  modal("处理待核对", [el("p", {}, item.model + " · 尚有 " + count + " 个请求待处理"), el("p", { class: "fine" }, "当前请求：" + item.request_id), grid, field("核对原因", reason), el("p", { class: "fine" }, "核对后重新校验生效的总额度、渠道或模型额度。之后收到真实用量时，将修正人工记录。")], async () => {
+  modal("处理待核对", [el("p", {}, item.model + " · 尚有 " + count + " 个请求待处理"), el("p", { class: "fine" }, "当前请求：" + item.request_id), grid, field("服务等级", tier.root), field("核对原因", reason), el("p", { class: "fine" }, "请按上游实际用量和服务等级核对；缺少组合费率时需先补齐模型价格。之后收到真实用量时，将修正人工记录。")], async () => {
     const tokens = Object.fromEntries(Object.entries(fields).map(([key, node]) => [key, Number(node.value)]));
     if (Object.values(tokens).some((v) => !Number.isSafeInteger(v) || v < 0)) throw new Error("Token 必须为有效的非负整数");
     tokens.total = tokens.input + tokens.output + tokens.cache_read + tokens.cache_write; tokens.complete = true;
+    tokens.service_tier = tier.value || null;
     await api("/settle", "POST", { request_id: item.request_id, model: item.model, tokens, reason: reason.value });
     await load(true); notify("已核对该请求");
   }, "确认用量并恢复", "alert");
