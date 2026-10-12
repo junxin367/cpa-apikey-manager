@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -53,7 +53,7 @@ struct Control {
     status: Status,
     missing: BTreeMap<String, Instant>,
 }
-type Shared = Arc<(Mutex<Control>, Condvar)>;
+type Shared = Arc<(Mutex<Control>, Condvar, Mutex<()>)>;
 struct Cached {
     url: String,
     fetched: Instant,
@@ -64,6 +64,19 @@ type Cache = BTreeMap<Source, Cached>;
 pub struct Worker {
     shared: Shared,
     handle: Option<JoinHandle<()>>,
+}
+pub struct Pause<'a> {
+    control: MutexGuard<'a, Control>,
+    _write: MutexGuard<'a, ()>,
+    wake: &'a Condvar,
+    resume: bool,
+}
+impl Drop for Pause<'_> {
+    fn drop(&mut self) {
+        self.control.pending = !self.control.stopped && self.resume;
+        self.control.force |= self.control.pending;
+        self.wake.notify_one();
+    }
 }
 impl Worker {
     pub fn start(config: Config, status: Status) -> Self {
@@ -80,6 +93,7 @@ impl Worker {
                 missing: BTreeMap::new(),
             }),
             Condvar::new(),
+            Mutex::new(()),
         ));
         let inner = Arc::clone(&shared);
         let handle = thread::Builder::new()
@@ -101,6 +115,20 @@ impl Worker {
             control.status.error = Some("无法启动价格同步线程，请检查宿主资源并重启插件".into());
         }
         Self { shared, handle }
+    }
+    pub fn pause(&self) -> Pause<'_> {
+        let write = self.shared.2.lock().unwrap_or_else(|e| e.into_inner());
+        let mut control = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
+        let resume = control.pending || control.running || control.config.price_sync.enabled;
+        control.generation += 1;
+        control.pending = false;
+        control.missing.clear();
+        Pause {
+            control,
+            _write: write,
+            wake: &self.shared.1,
+            resume,
+        }
     }
     pub fn reconfigure(&self, config: Config) {
         let mut control = self.shared.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -224,7 +252,14 @@ fn run(shared: &Shared) {
         status.updated = 0;
         status.sources.clear();
         status.error = None;
-        let result = synchronize(&config, &mut cache, &mut status, &cancelled, fresh);
+        let result = synchronize(
+            &config,
+            &mut cache,
+            &mut status,
+            &cancelled,
+            fresh,
+            &shared.2,
+        );
         if let Err(error) = result {
             status.error = Some(error);
         }
@@ -246,13 +281,16 @@ fn run(shared: &Shared) {
         drop(control);
         // Keep DB waits outside the control lock used by request hooks.
         if persist {
-            if let Ok(db) = Connection::open(config.data_dir.join("manager.sqlite3")) {
-                let _ = db.busy_timeout(Duration::from_secs(2));
-                let _ = db.execute(
-                    "INSERT INTO meta(name,value) VALUES('price_sync_status',?1)
-                     ON CONFLICT(name) DO UPDATE SET value=excluded.value",
-                    [serde_json::to_string(&status).unwrap_or_default()],
-                );
+            let _write = shared.2.lock().unwrap_or_else(|e| e.into_inner());
+            if !cancelled() {
+                if let Ok(db) = Connection::open(config.data_dir.join("manager.sqlite3")) {
+                    let _ = db.busy_timeout(Duration::from_secs(2));
+                    let _ = db.execute(
+                        "INSERT INTO meta(name,value) VALUES('price_sync_status',?1)
+                         ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                        [serde_json::to_string(&status).unwrap_or_default()],
+                    );
+                }
             }
         }
     }
@@ -311,6 +349,7 @@ fn synchronize(
     status: &mut Status,
     cancelled: &impl Fn() -> bool,
     fresh: Duration,
+    write_lock: &Mutex<()>,
 ) -> Result<(), String> {
     let source_config = config::read_source(config)?;
     let mut db = Connection::open(config.data_dir.join("manager.sqlite3"))
@@ -477,6 +516,10 @@ fn synchronize(
             .validate()
             .map_err(|_| "价格目录中的计费规则无效")?;
     }
+    let _write = write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    if cancelled() {
+        return Err("价格同步已取消".into());
+    }
     let now = Utc::now();
     let tx = db.transaction().map_err(storage)?;
     let mut added = 0;
@@ -550,6 +593,38 @@ fn synchronize(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn pausing_preserves_manual_sync_and_stopped_status() {
+        let make_worker = |enabled: bool, stopped: bool, pending: bool| {
+            let mut config = Config::default();
+            config.price_sync.enabled = enabled;
+            Worker {
+                shared: Arc::new((
+                    Mutex::new(Control {
+                        config,
+                        generation: 0,
+                        pending,
+                        force: false,
+                        refresh: false,
+                        running: false,
+                        stopped,
+                        status: Status::default(),
+                        missing: BTreeMap::new(),
+                    }),
+                    Condvar::new(),
+                    Mutex::new(()),
+                )),
+                handle: None,
+            }
+        };
+        let stopped = make_worker(true, true, false);
+        drop(stopped.pause());
+        let manual = make_worker(false, false, true);
+        drop(manual.pause());
+        assert_eq!(stopped.status()["running"], false);
+        assert_eq!(manual.status()["running"], true);
+    }
 
     #[test]
     fn upgrades_automatic_rules_without_merging_sources_or_touching_manual_prices() {
@@ -669,6 +744,7 @@ mod tests {
             &mut status,
             &|| false,
             Duration::from_secs(3600),
+            &Mutex::new(()),
         )
         .unwrap();
         assert_eq!((status.added, status.updated), (1, 1));
@@ -711,6 +787,7 @@ mod tests {
             &mut status,
             &|| false,
             Duration::from_secs(3600),
+            &Mutex::new(()),
         )
         .unwrap();
         assert_eq!((status.added, status.updated), (0, 0));
@@ -729,6 +806,7 @@ mod tests {
             &mut status,
             &|| false,
             Duration::from_secs(3600),
+            &Mutex::new(()),
         )
         .is_err());
         let unchanged: String = db

@@ -204,7 +204,11 @@ async function api(path, method = "GET", body, timeout = 20000) {
     body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeout),
   });
   let data;
-  try { data = await response.json(); } catch { throw new Error("宿主返回了无效响应，请检查插件状态"); }
+  try { data = await response.json(); } catch {
+    const error = new Error("宿主返回了无效响应，请检查插件状态");
+    error.code = "invalid_response";
+    throw error;
+  }
   if (!response.ok) {
     const error = new Error(data.error?.message || (response.status === 401 ? "管理密钥无效" : "请求失败：" + response.status));
     error.code = data.error?.code; error.status = response.status;
@@ -262,14 +266,12 @@ function renderCredentialState(message = "") {
 function renderBackupSettings() {
   const connected = !!token && !!snapshot;
   $("export-backup").disabled = !connected || savingBackup;
-  $("import-backup").disabled = !connected || savingBackup || snapshot?.enforcement_enabled === true;
+  $("import-backup").disabled = !connected || savingBackup;
   $("import-backup-hint").title = !connected ? "请先连接管理接口，再导入备份"
     : savingBackup ? "备份正在处理，请稍候再导入"
-    : snapshot.enforcement_enabled === true ? "请关闭上方“启用请求拦截”，再导入备份"
     : "";
-  $("backup-detail").textContent = !connected ? "连接管理接口后可导出、导入。"
-    : snapshot.enforcement_enabled ? "可随时导出。导入前请先关闭上方的请求拦截，并暂停客户端请求。"
-    : "导出、导入支持不超过 64 MB 的 JSON 文件。导入前请暂停客户端请求，并保留宿主原有 API 密钥配置。";
+  $("backup-detail").textContent = !connected ? "连接后可导出、导入备份。"
+    : "支持 JSON 文件，最大 64 MB。";
 }
 $("export-backup").onclick = () => guard(async () => {
   if (savingBackup) return;
@@ -299,23 +301,32 @@ $("backup-file").onchange = () => guard(async () => {
     summary = await api("/backup/validate", "POST", { backup: archive }, 90000);
   }
   finally { savingBackup = false; restore(); renderBackupSettings(); }
-  const acknowledgment = el("input", { type: "checkbox", required: true });
   modal("确认导入备份", [
     el("p", {}, "文件：" + file.name),
     el("p", { class: "fine" }, "导出时间：" + date(archive.data.exported_at, true, false) + " · 插件版本：" + archive.data.plugin_version),
     el("p", {}, summary.keys + " 把密钥记录、" + summary.prices + " 个模型价格、" + summary.usage + " 条历史用量"),
-    el("p", { class: "fine" }, "导入将覆盖当前权限、额度、价格和账本。当前数据会先保存为服务器数据目录中的回退备份；恢复后拦截保持关闭，未完成请求转为待核对。"),
-    el("label", { class: "remember-control" }, acknowledgment, el("span", {}, "我已暂停客户端请求，确认覆盖当前插件数据")),
+    el("p", { class: "fine" }, "导入将覆盖当前权限、额度、价格和账本。当前数据会先保存为服务器数据目录中的回退备份；导入后保留当前请求拦截状态，备份中的未完成请求转为待核对。"),
   ], async () => {
-    if (!acknowledgment.checked) throw new Error("请先确认覆盖当前插件数据");
     savingBackup = true; renderBackupSettings(); renderEnforcementState();
     try {
       const result = await api("/backup/import", "POST", { backup: archive, confirmed: true }, 90000);
+      if (result?.ok !== true || typeof result.rollback_file !== "string" || !result.rollback_file) {
+        const error = new Error("宿主返回了无效导入响应");
+        error.code = "invalid_response";
+        throw error;
+      }
       dirty = false; draft = null; selected = ""; drafts.clear(); revealedKeys.clear(); revealAll = false;
       remoteKeyMatches.clear(); keySearchSequence++; priceRowsSignature = ""; autoTimeZoneDone = true;
-      $("backup-result").textContent = "导入成功。回退备份已保存在服务器插件数据目录：" + result.rollback_file + "。请检查数据后重新开启拦截。";
+      $("backup-result").textContent = "导入成功。回退备份已保存在服务器插件数据目录：" + result.rollback_file + "。请检查恢复的数据。";
       try { await load(); } catch (error) { throw new Error("备份已恢复，但刷新数据失败，请点击顶部“刷新数据”：" + error.message); }
-      notify("备份已恢复，请检查数据后重新开启拦截");
+      notify("备份已恢复，请检查恢复的数据");
+    } catch (error) {
+      if (["TimeoutError", "AbortError", "TypeError"].includes(error.name) || error.code === "invalid_response") {
+        dirty = false; draft = null; selected = ""; drafts.clear(); revealedKeys.clear(); revealAll = false;
+        remoteKeyMatches.clear(); keySearchSequence++; priceRowsSignature = ""; autoTimeZoneDone = true;
+        throw new Error("导入结果未确认，可能仍在后台进行。页面旧草稿已清除，请刷新检查数据，确认结果前不要重复导入。");
+      }
+      throw error;
     } finally { savingBackup = false; renderBackupSettings(); renderEnforcementState(); }
   }, "覆盖并恢复", "alert");
 });

@@ -318,28 +318,33 @@ impl Engine {
                 "请确认覆盖当前插件数据后再导入",
             ));
         }
-        if self.enforcement_enabled()? {
-            return Err(Fault::new(
-                409,
-                "backup_enforcement_enabled",
-                "请先关闭请求拦截并暂停客户端请求，再导入备份",
-            ));
-        }
+        let enabled = self.enforcement_enabled()?;
         let restored = self.prepare_backup(value)?;
         restored.db.execute(
-            "UPDATE meta SET value='false' WHERE name='enforcement_enabled'",
-            [],
+            "UPDATE meta SET value=?1 WHERE name='enforcement_enabled'",
+            [if enabled { "true" } else { "false" }],
         )?;
         restored.db.execute(
             "UPDATE requests SET status='review' WHERE status='pending'",
             [],
         )?;
+        let key_ids = self
+            .keys
+            .iter()
+            .filter_map(|(scope, key)| {
+                restored
+                    .keys
+                    .get(scope)
+                    .map(|restored_key| (key.id.clone(), restored_key.id.clone()))
+            })
+            .collect();
+        crate::backup::retain_pending(&self.db, &restored.db, &key_ids)?;
         restored.db.execute(
             "INSERT INTO audit(created,action,subject,detail) VALUES(?1,'backup_import','database','')",
             [Utc::now().timestamp_millis()],
         )?;
-        let had_worker = self.price_sync.is_some();
-        drop(self.price_sync.take());
+        let worker = self.price_sync.take();
+        let pause = worker.as_ref().map(crate::price_sync::Worker::pause);
         let result = (|| {
             let current = self.export_backup()?;
             let rollback = crate::backup::save_rollback(&self.config.data_dir, &current)?;
@@ -354,12 +359,8 @@ impl Engine {
             self.source_error = None;
             self.health_error = None;
         }
-        if had_worker {
-            self.price_sync = Some(crate::price_sync::Worker::start(
-                self.config.clone(),
-                crate::price_sync::Status::default(),
-            ));
-        }
+        drop(pause);
+        self.price_sync = worker;
         let rollback = result?;
         Ok(json!({"ok":true,"rollback_file":rollback,"summary":crate::backup::summary(&self.db)?}))
     }
@@ -1104,7 +1105,20 @@ impl Engine {
             .and_then(|key| self.policy(key).ok())
             .is_some_and(|policy| !policy.enforcement_configured())
         {
-            return Ok(());
+            let admitted: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM requests WHERE key_id=?4 AND model=?2
+                 AND (request_id=?1 OR (?3<>'' AND trace_id=?3)))",
+                params![
+                    string(record, "RequestID").unwrap_or(""),
+                    string(record, "Model").unwrap_or(""),
+                    string(record, "TraceID").unwrap_or(""),
+                    fallback_key
+                ],
+                |row| row.get(0),
+            )?;
+            if !admitted {
+                return Ok(());
+            }
         }
         let rid = string(record, "RequestID").ok_or("用量事件缺少 RequestID")?;
         let model = string(record, "Model").ok_or("用量事件缺少 Model")?;
@@ -1563,7 +1577,7 @@ impl TimeZone for Zone {
     }
 }
 
-fn decode_policy(text: &str) -> Result<Policy> {
+pub(crate) fn decode_policy(text: &str) -> Result<Policy> {
     let mut value: Value = serde_json::from_str(text)?;
     let object = value.as_object_mut().ok_or("已保存的密钥规则格式无效")?;
     if !object.contains_key("total_quota_enabled") {

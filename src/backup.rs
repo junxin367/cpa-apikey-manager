@@ -214,6 +214,45 @@ pub fn prepare(value: Value) -> Result<Connection> {
             return Err(invalid("备份中的账本时间无效"));
         }
     }
+    let mut statement = db.prepare("SELECT policy FROM keys")?;
+    for row in statement.query_map([], |r| r.get::<_, String>(0))? {
+        let policy =
+            crate::engine::decode_policy(&row?).map_err(|_| invalid("备份中的密钥规则无效"))?;
+        if !["day", "week", "month"].contains(&policy.period.as_str())
+            || !["model", "channel"].contains(&policy.rule_mode.as_str())
+            || !["allow", "deny"].contains(&policy.total_access.as_str())
+            || policy.revision < 0
+            || policy.note.chars().count() > 100
+            || policy.rules.len() > 1000
+            || (policy.total_quota_enabled
+                && policy.total_access == "allow"
+                && policy.total_quota.is_none())
+        {
+            return Err(invalid("备份中的密钥权限或额度配置无效"));
+        }
+        if let Some(quota) = &policy.total_quota {
+            quota.amount().map_err(|_| invalid("备份中的总额度无效"))?;
+        }
+        for (name, rule) in &policy.rules {
+            crate::engine::validate_model(name).map_err(|_| invalid("备份中的模型规则无效"))?;
+            if !["allow", "deny"].contains(&rule.access.as_str()) {
+                return Err(invalid("备份中的模型权限无效"));
+            }
+        }
+        for (name, rule) in &policy.channel_rules {
+            if !crate::channel::valid(name) || !["allow", "deny"].contains(&rule.access.as_str()) {
+                return Err(invalid("备份中的渠道权限无效"));
+            }
+        }
+        for rule in policy.rules.values().chain(policy.channel_rules.values()) {
+            if let Some(quota) = &rule.quota {
+                quota
+                    .amount()
+                    .map_err(|_| invalid("备份中的分项额度无效"))?;
+            }
+        }
+    }
+    drop(statement);
     let mut statement = db.prepare(
         "SELECT price FROM prices UNION ALL SELECT price FROM requests WHERE price IS NOT NULL",
     )?;
@@ -255,13 +294,18 @@ pub fn prepare(value: Value) -> Result<Connection> {
     }
     drop(statement);
     let invalid_state: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM requests WHERE status NOT IN ('pending','review','settled'))",
+        "SELECT EXISTS(SELECT 1 FROM requests WHERE status NOT IN ('pending','review','settled'))
+         OR EXISTS(SELECT 1 FROM keys WHERE active NOT IN (0,1))
+         OR EXISTS(SELECT 1 FROM usage WHERE failed NOT IN (0,1) OR stream NOT IN (0,1) OR manual NOT IN (0,1))",
         [],
         |r| r.get(0),
     )?;
     let orphan: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM usage WHERE key_id NOT IN (SELECT id FROM keys))
-         OR EXISTS(SELECT 1 FROM requests WHERE key_id NOT IN (SELECT id FROM keys))",
+         OR EXISTS(SELECT 1 FROM requests WHERE key_id NOT IN (SELECT id FROM keys))
+         OR EXISTS(SELECT 1 FROM usage u LEFT JOIN requests r
+                   ON r.request_id=u.request_id AND r.model=u.model
+                   WHERE r.request_id IS NULL OR r.key_id<>u.key_id)",
         [],
         |r| r.get(0),
     )?;
@@ -269,6 +313,52 @@ pub fn prepare(value: Value) -> Result<Connection> {
         return Err(invalid("备份中的请求状态或密钥关联无效"));
     }
     Ok(db)
+}
+
+pub fn retain_pending(
+    source: &Connection,
+    target: &Connection,
+    key_ids: &BTreeMap<String, String>,
+) -> Result<()> {
+    let names: Vec<_> = columns(source, "requests")?
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    let key_index = names
+        .iter()
+        .position(|name| name == "key_id")
+        .ok_or("请求字段无效")?;
+    let status_index = names
+        .iter()
+        .position(|name| name == "status")
+        .ok_or("请求字段无效")?;
+    let mut query = source.prepare(&format!(
+        "SELECT {} FROM requests WHERE status='pending'",
+        names.join(",")
+    ))?;
+    let mut insert = target.prepare(&format!(
+        "INSERT OR IGNORE INTO requests({}) VALUES({})",
+        names.join(","),
+        vec!["?"; names.len()].join(",")
+    ))?;
+    let rows = query.query_map([], |row| {
+        (0..names.len())
+            .map(|index| row.get::<_, SqlValue>(index))
+            .collect::<rusqlite::Result<Vec<_>>>()
+    })?;
+    for row in rows {
+        let mut values = row?;
+        let SqlValue::Text(key) = &values[key_index] else {
+            continue;
+        };
+        let Some(restored_key) = key_ids.get(key) else {
+            continue;
+        };
+        values[key_index] = SqlValue::Text(restored_key.clone());
+        values[status_index] = SqlValue::Text("review".into());
+        insert.execute(params_from_iter(values))?;
+    }
+    Ok(())
 }
 
 pub fn summary(db: &Connection) -> Result<Value> {
@@ -366,6 +456,112 @@ mod tests {
     }
 
     #[test]
+    fn import_preserves_inflight_admissions_without_merging_settled_usage() {
+        let root = root();
+        let raw = "sk-import-ongoing-probe";
+        let mut target = engine(&root, raw);
+        let key = target.snapshot(Utc::now()).unwrap()["keys"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        target
+            .save_policy(
+                &key,
+                Policy {
+                    total_quota_enabled: true,
+                    total_quota: Some(Quota {
+                        unit: "tokens".into(),
+                        limit: "1000".into(),
+                    }),
+                    ..Policy::default()
+                },
+                false,
+                Utc::now(),
+            )
+            .unwrap();
+        target
+            .save_price(
+                "gpt-5.5",
+                serde_json::from_value(json!({"input":"1","output":"2"})).unwrap(),
+                0,
+            )
+            .unwrap();
+        target.set_enforcement_enabled(true).unwrap();
+        let archive = target.export_backup().unwrap();
+        let request = json!({"RequestID":"ongoing-across-import","Model":"gpt-5.5","RequestedModel":"gpt-5.5",
+            "Metadata":{"caller_scope":crate::config::caller_scope(raw)}});
+        target.intercept(&request, true, Utc::now()).unwrap();
+        target.import_backup(archive, true).unwrap();
+        target.usage(&json!({"RequestID":"ongoing-across-import","APIKey":raw,"Model":"gpt-5.5","Provider":"openai",
+            "Detail":{"InputTokens":9,"OutputTokens":1,"TotalTokens":10}}), Utc::now()).unwrap();
+        let total =
+            target.snapshot(Utc::now()).unwrap()["keys"][0]["total_usage"]["tokens"].clone();
+        let mut source = engine(&root.join("source"), raw);
+        let foreign = source.export_backup().unwrap();
+        let request = json!({"RequestID":"ongoing-new-secret","Model":"gpt-5.5","RequestedModel":"gpt-5.5",
+            "Metadata":{"caller_scope":crate::config::caller_scope(raw)}});
+        target.intercept(&request, true, Utc::now()).unwrap();
+        target.import_backup(foreign, true).unwrap();
+        target.usage(&json!({"RequestID":"ongoing-new-secret","APIKey":raw,"Model":"gpt-5.5","Provider":"openai",
+            "Detail":{"InputTokens":9,"OutputTokens":1,"TotalTokens":10}}), Utc::now()).unwrap();
+        let state = target.snapshot(Utc::now()).unwrap();
+        let rebound = state["keys"][0]["id"] != key;
+        let resumed = state["keys"][0]["total_usage"]["tokens"].clone();
+        let usage_count: i64 = target
+            .db
+            .query_row("SELECT COUNT(*) FROM usage", [], |row| row.get(0))
+            .unwrap();
+        let good = target.export_backup().unwrap();
+        let mut orphan = good.clone();
+        orphan["data"]["tables"]["requests"]["rows"] = json!([]);
+        resign(&mut orphan);
+        let orphan_rejected = target.validate_backup(orphan).is_err();
+        let mut flag = good;
+        let index = flag["data"]["tables"]["usage"]["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|name| name == "manual")
+            .unwrap();
+        flag["data"]["tables"]["usage"]["rows"][0][index] = json!("2");
+        resign(&mut flag);
+        let flag_rejected = target.validate_backup(flag).is_err();
+        drop(source);
+        drop(target);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(total, "10");
+        assert!(rebound);
+        assert_eq!(resumed, "10");
+        assert_eq!(usage_count, 1);
+        assert!(orphan_rejected && flag_rejected);
+    }
+
+    #[test]
+    fn backup_rejects_invalid_permission_fields() {
+        let root = root();
+        let mut target = engine(&root, "sk-import-policy-probe");
+        let mut archive = target.export_backup().unwrap();
+        let columns = archive["data"]["tables"]["keys"]["columns"]
+            .as_array()
+            .unwrap();
+        let index = columns.iter().position(|name| name == "policy").unwrap();
+        let mut policy: Value = serde_json::from_str(
+            archive["data"]["tables"]["keys"]["rows"][0][index]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        policy["rule_mode"] = json!("unknown");
+        policy["total_access"] = json!("unknown");
+        archive["data"]["tables"]["keys"]["rows"][0][index] = json!(policy.to_string());
+        resign(&mut archive);
+        let result = target.validate_backup(archive);
+        drop(target);
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn full_backup_restores_key_identity_quotas_ledger_and_integer_precision() {
         let root = root();
         let raw = "sk-backup-test-original";
@@ -431,7 +627,7 @@ mod tests {
         let previous_key = target.snapshot(Utc::now()).unwrap()["keys"][0]["id"].clone();
         assert_ne!(previous_key, key);
         target.validate_backup(archive.clone()).unwrap();
-        let result = target.import_backup(archive, true).unwrap();
+        let result = target.import_backup(archive.clone(), true).unwrap();
         let snapshot = target.snapshot(Utc::now()).unwrap();
         assert_eq!(snapshot["enforcement_enabled"], false);
         assert_eq!(snapshot["timezone"], "Asia/Shanghai");
@@ -458,6 +654,9 @@ mod tests {
         let rollback_db = prepare(rollback).unwrap();
         assert_eq!(summary(&rollback_db).unwrap()["usage"], 0);
         drop(rollback_db);
+        target.set_enforcement_enabled(true).unwrap();
+        target.import_backup(archive, true).unwrap();
+        assert!(target.enforcement_enabled().unwrap());
         drop(source);
         drop(target);
         let mut reopened = engine(&root.join("target"), raw);
@@ -480,14 +679,6 @@ mod tests {
             "backup_confirmation_required"
         );
         target.set_enforcement_enabled(true).unwrap();
-        assert_eq!(
-            target
-                .import_backup(archive.clone(), true)
-                .unwrap_err()
-                .code,
-            "backup_enforcement_enabled"
-        );
-        target.set_enforcement_enabled(false).unwrap();
         let mut damaged = archive.clone();
         damaged["sha256"] = json!("invalid");
         assert_eq!(
@@ -526,6 +717,7 @@ mod tests {
         assert_eq!(before["keys"], after["data"]["tables"]["keys"]);
         assert_eq!(before["usage"], after["data"]["tables"]["usage"]);
         assert_eq!(before["prices"], after["data"]["tables"]["prices"]);
+        assert!(target.enforcement_enabled().unwrap());
         assert!(!fs::read_dir(&root).unwrap().any(|entry| entry
             .unwrap()
             .file_name()
