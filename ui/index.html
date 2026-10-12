@@ -157,7 +157,7 @@
             <div class="settings-body">
               <div class="credential-row">
                 <button id="export-backup" class="secondary" type="button" disabled><span data-icon="download"></span>导出备份</button>
-                <button id="import-backup" class="secondary" type="button" disabled><span data-icon="upload"></span>导入备份</button>
+                <span id="import-backup-hint" class="backup-import-hint" title="请先连接管理接口，再导入备份"><button id="import-backup" class="secondary" type="button" disabled><span data-icon="upload"></span>导入备份</button></span>
                 <input id="backup-file" type="file" accept=".json,application/json" hidden>
               </div>
               <p id="backup-detail" class="fine">连接管理接口后可导出、导入。</p>

@@ -423,6 +423,9 @@ th.num, td.num { text-align: right; }
 .credential-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
 .credential-row .secret-field { flex: 1 1 320px; }
 .credential-row .primary { height: var(--control-large); min-width: 112px; }
+.backup-import-hint { display: inline-flex; }
+.backup-import-hint[title]:not([title=""]) { cursor: not-allowed; }
+.backup-import-hint button:disabled { pointer-events: none; }
 .credential-options { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--space-2) var(--space-4); }
 .settings-info { max-width: 680px; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: var(--space-4) var(--space-6); margin: 0; }
 .settings-info > div { min-width: 0; display: grid; gap: 2px; }

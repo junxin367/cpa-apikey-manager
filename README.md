@@ -34,6 +34,7 @@ CLIProxyAPI 原生插件：读取宿主已创建的 API 密钥，独立开关全
 ## 已验证环境与边界
 
 - v0.1.0 基线在 Windows x64、CLIProxyAPI **v8.0.4** 官方二进制中实际加载 DLL，验证了 Chat Completions、Responses、Anthropic Messages，以及 SSE 流式请求。
+- v0.6.3 为置灰的“导入备份”按钮增加悬停提示：拦截开启时提示 `请关闭上方“启用请求拦截”，再导入备份`，未连接和备份处理中显示对应原因，可导入时清除提示。导入限制及数据恢复逻辑不变；按要求未进行本轮本地测试或浏览器验收。
 - v0.6.2 新增完整 JSON 数据备份与覆盖恢复，保留权限、额度、价格、用量账本和密钥标识；导入先校验并保存回退备份，恢复后保持拦截关闭。通过 41 项 Rust、4 项 JavaScript 测试、Windows Release 构建，以及隔离宿主新数据目录恢复与重启验证；Chrome 导出下载和恢复后展示通过，浏览器文件上传与确认导入步骤保留未验证。
 - v0.6.1 简化自动计费规则：基础价格和规则使用同一来源，仅导入长上下文、服务等级两类独立规则，不跨源补入 batch／flex，也不自动展开组合档位。服务等级匹配后优先使用该等级费率，无需另配组合规则；旧自动价格同步更新，手动价格、请求快照和已结算费用不变。兼容 Claude 上游总量未包含缓存创建的口径差异，并移除人工核对的原因填写要求。通过 37 项 Rust、4 项 JavaScript 测试、Windows Release 构建与本轮 Chrome 价格展示、保存、校验和隔离宿主计价验证。
 - v0.6.0 同步并结算长上下文与服务等级计费规则：价格页新增“计费规则”列和可折叠编辑器，支持 `>272K`、fast/priority、flex、batch、ultrafast 及组合档位；自动同步从 models.dev `cost.tiers`、`experimental.modes` 和 LiteLLM 的 `*_above_<门槛>_tokens`、`*_priority` 等字段导入规则，并一次性升级旧版只含基础费率的自动价格。通过 35 项 Rust、4 项 JavaScript 测试、Windows Release 构建、隔离宿主端到端验收，以及 Chrome 价格页规则展示与编辑验证。

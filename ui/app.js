@@ -263,6 +263,10 @@ function renderBackupSettings() {
   const connected = !!token && !!snapshot;
   $("export-backup").disabled = !connected || savingBackup;
   $("import-backup").disabled = !connected || savingBackup || snapshot?.enforcement_enabled === true;
+  $("import-backup-hint").title = !connected ? "请先连接管理接口，再导入备份"
+    : savingBackup ? "备份正在处理，请稍候再导入"
+    : snapshot.enforcement_enabled === true ? "请关闭上方“启用请求拦截”，再导入备份"
+    : "";
   $("backup-detail").textContent = !connected ? "连接管理接口后可导出、导入。"
     : snapshot.enforcement_enabled ? "可随时导出。导入前请先关闭上方的请求拦截，并暂停客户端请求。"
     : "导出、导入支持不超过 64 MB 的 JSON 文件。导入前请暂停客户端请求，并保留宿主原有 API 密钥配置。";
