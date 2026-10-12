@@ -28,7 +28,8 @@ pub fn registration(req: &Value) -> Value {
     let base = req["BasePath"].as_str().unwrap_or("/v0/management");
     let routes: Vec<_> = [
         ("GET","state"),("GET","reviews"),("POST","key"),("POST","key-search"),("PUT","settings"),("PUT","policy"),("PUT","price"),
-        ("POST","sync-models"),("POST","sync-prices"),("POST","model"),("POST","settle")
+        ("POST","sync-models"),("POST","sync-prices"),("POST","model"),("POST","settle"),
+        ("GET","backup/export"),("POST","backup/validate"),("POST","backup/import")
     ].iter().map(|(method,path)|json!({"Method":method,"Path":format!("{base}/plugins/cpa-apikey-manager/{path}")})).collect();
     json!({"routes":routes,"resources":[
         {"Path":"/index.html","Menu":"密钥权限与额度","Description":"按 API 密钥管理模型权限、Token 与金额额度"},
@@ -115,6 +116,16 @@ mod tests {
             route["Method"] == "PUT"
                 && route["Path"] == "/v0/management/plugins/cpa-apikey-manager/settings"
         }));
+        for (method, path) in [
+            ("GET", "backup/export"),
+            ("POST", "backup/validate"),
+            ("POST", "backup/import"),
+        ] {
+            assert!(routes.iter().any(|route| {
+                route["Method"] == method
+                    && route["Path"] == format!("/v0/management/plugins/cpa-apikey-manager/{path}")
+            }));
+        }
     }
 }
 fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
@@ -124,13 +135,21 @@ fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
         .unwrap_or("")
         .strip_prefix(PREFIX)
         .unwrap_or("");
+    let body_limit = if matches!(route, "/backup/validate" | "/backup/import") {
+        crate::backup::MAX_BYTES + 1024
+    } else {
+        1024 * 1024
+    };
     let body = match req["Body"].as_str() {
-        Some(body) if body.len() <= 1_400_000 => {
+        Some(body) if body.len() <= (body_limit + 2) / 3 * 4 => {
             STANDARD.decode(body).map_err(|_| "请求编码无效")?
         }
-        Some(_) => return Err(Fault::new(413, "body_too_large", "请求超过 1 MB 限制")),
+        Some(_) => return Err(Fault::new(413, "body_too_large", "请求超过大小限制")),
         None => Vec::new(),
     };
+    if body.len() > body_limit {
+        return Err(Fault::new(413, "body_too_large", "请求超过大小限制"));
+    }
     let data: Value = if body.is_empty() {
         json!({})
     } else {
@@ -144,6 +163,12 @@ fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
     };
     match (method, route) {
         ("GET", "/state") => engine.snapshot(Utc::now()),
+        ("GET", "/backup/export") => engine.export_backup(),
+        ("POST", "/backup/validate") => engine.validate_backup(data["backup"].clone()),
+        ("POST", "/backup/import") => engine.import_backup(
+            data["backup"].clone(),
+            data["confirmed"].as_bool().unwrap_or(false),
+        ),
         ("GET", "/reviews") => engine.ledger(
             query(req, "key"),
             query(req, "model"),

@@ -10,6 +10,7 @@ let priceRowsSignature = "";
 let credentialSource = "";
 let comboboxSequence = 0;
 let savingEnforcement = false;
+let savingBackup = false;
 // Time zone setting: auto-detection runs once per connection when the server has no saved zone.
 let savingTimeZone = false, autoTimeZoneDone = false, timeZonePicker = null;
 let revealingKeys = false;
@@ -50,6 +51,8 @@ function icon(name) {
     undo: ["M9 14 4 9l5-5", "M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"],
     arrowRight: ["M5 12h14", "m12 5 7 7-7 7"],
     chevronDown: ["m6 9 6 6 6-6"],
+    download: ["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4", "m7 10 5 5 5-5", "M12 15V3"],
+    upload: ["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4", "m7 8 5-5 5 5", "M12 3v12"],
   };
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("class", "icon"); svg.setAttribute("aria-hidden", "true");
@@ -194,11 +197,11 @@ function notify(message, error = false) {
   $("toast").className = "toast" + (error ? " error" : ""); $("toast").hidden = false;
   toastTimer = setTimeout(() => $("toast").hidden = true, error ? 7000 : 3200);
 }
-async function api(path, method = "GET", body) {
+async function api(path, method = "GET", body, timeout = 20000) {
   const response = await fetch(API + path, {
     method, credentials: "omit", cache: "no-store",
     headers: { ...(token ? { Authorization: "Bearer " + token } : {}), "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(20000),
+    body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeout),
   });
   let data;
   try { data = await response.json(); } catch { throw new Error("宿主返回了无效响应，请检查插件状态"); }
@@ -256,6 +259,62 @@ function renderCredentialState(message = "") {
   renderTimezoneSetting();
   renderEnforcementState();
 }
+function renderBackupSettings() {
+  const connected = !!token && !!snapshot;
+  $("export-backup").disabled = !connected || savingBackup;
+  $("import-backup").disabled = !connected || savingBackup || snapshot?.enforcement_enabled === true;
+  $("backup-detail").textContent = !connected ? "连接管理接口后可导出、导入。"
+    : snapshot.enforcement_enabled ? "可随时导出。导入前请先关闭上方的请求拦截，并暂停客户端请求。"
+    : "导出、导入支持不超过 64 MB 的 JSON 文件。导入前请暂停客户端请求，并保留宿主原有 API 密钥配置。";
+}
+$("export-backup").onclick = () => guard(async () => {
+  if (savingBackup) return;
+  savingBackup = true; const restore = pendingButton($("export-backup"), "导出中…");
+  renderBackupSettings();
+  try {
+    const archive = await api("/backup/export", "GET", undefined, 90000);
+    const file = new Blob([JSON.stringify(archive)], { type: "application/json" });
+    const url = URL.createObjectURL(file);
+    const name = "cpa-apikey-manager-backup-" + archive.data.exported_at.replace(/[:.]/g, "-") + ".json";
+    const link = el("a", { href: url, download: name }); document.body.append(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    $("backup-result").textContent = "已生成备份：" + name + "，请确认下载完成并保存到容器之外。";
+    notify("已生成数据备份");
+  } finally { savingBackup = false; restore(); renderBackupSettings(); }
+});
+$("import-backup").onclick = () => { $("backup-file").value = ""; $("backup-file").click(); };
+$("backup-file").onchange = () => guard(async () => {
+  const file = $("backup-file").files[0];
+  if (!file || savingBackup) return;
+  savingBackup = true; const restore = pendingButton($("import-backup"), "校验中…");
+  renderBackupSettings();
+  let archive, summary;
+  try {
+    if (file.size > 64 * 1024 * 1024) throw new Error("备份文件超过 64 MB");
+    try { archive = JSON.parse(await file.text()); } catch { throw new Error("文件不是有效的 JSON 备份"); }
+    summary = await api("/backup/validate", "POST", { backup: archive }, 90000);
+  }
+  finally { savingBackup = false; restore(); renderBackupSettings(); }
+  const acknowledgment = el("input", { type: "checkbox", required: true });
+  modal("确认导入备份", [
+    el("p", {}, "文件：" + file.name),
+    el("p", { class: "fine" }, "导出时间：" + date(archive.data.exported_at, true, false) + " · 插件版本：" + archive.data.plugin_version),
+    el("p", {}, summary.keys + " 把密钥记录、" + summary.prices + " 个模型价格、" + summary.usage + " 条历史用量"),
+    el("p", { class: "fine" }, "导入将覆盖当前权限、额度、价格和账本。当前数据会先保存为服务器数据目录中的回退备份；恢复后拦截保持关闭，未完成请求转为待核对。"),
+    el("label", { class: "remember-control" }, acknowledgment, el("span", {}, "我已暂停客户端请求，确认覆盖当前插件数据")),
+  ], async () => {
+    if (!acknowledgment.checked) throw new Error("请先确认覆盖当前插件数据");
+    savingBackup = true; renderBackupSettings(); renderEnforcementState();
+    try {
+      const result = await api("/backup/import", "POST", { backup: archive, confirmed: true }, 90000);
+      dirty = false; draft = null; selected = ""; drafts.clear(); revealedKeys.clear(); revealAll = false;
+      remoteKeyMatches.clear(); keySearchSequence++; priceRowsSignature = ""; autoTimeZoneDone = true;
+      $("backup-result").textContent = "导入成功。回退备份已保存在服务器插件数据目录：" + result.rollback_file + "。请检查数据后重新开启拦截。";
+      try { await load(); } catch (error) { throw new Error("备份已恢复，但刷新数据失败，请点击顶部“刷新数据”：" + error.message); }
+      notify("备份已恢复，请检查数据后重新开启拦截");
+    } finally { savingBackup = false; renderBackupSettings(); renderEnforcementState(); }
+  }, "覆盖并恢复", "alert");
+});
 function renderSettingsInfo() {
   $("settings-info").hidden = !snapshot;
   if (!snapshot) return;
@@ -272,6 +331,7 @@ function renderSettingsInfo() {
   $("settings-info-list").replaceChildren(...items.map(([label, value]) => el("div", {}, el("dt", {}, label), el("dd", {}, value))));
 }
 function renderEnforcementState() {
+  renderBackupSettings();
   const connected = !!token && !!snapshot;
   const enabled = connected && snapshot.enforcement_enabled === true;
   $("plugin-status").textContent = connected ? (enabled ? "拦截已启用" : "拦截未启用") : "状态待连接";
@@ -279,7 +339,7 @@ function renderEnforcementState() {
   $("plugin-status-chip").classList.toggle("warn", !enabled);
   const control = $("settings-enforcement-enabled");
   control.checked = enabled;
-  control.disabled = !connected || savingEnforcement;
+  control.disabled = !connected || savingEnforcement || savingBackup;
   $("settings-enforcement-label").textContent = enabled ? "已启用" : "未启用";
   $("settings-enforcement-detail").textContent = !connected
     ? "连接管理接口后可设置。"

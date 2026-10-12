@@ -152,6 +152,20 @@
               <p class="fine">切换时区后按新的周期边界重新汇总已有记录，历史用量不会丢失。</p>
             </div>
           </section>
+          <section class="settings-section" aria-labelledby="settings-backup-title">
+            <div class="settings-aside"><h2 id="settings-backup-title">数据备份</h2><p class="muted">导出完整插件数据，更新容器后可从备份恢复。</p></div>
+            <div class="settings-body">
+              <div class="credential-row">
+                <button id="export-backup" class="secondary" type="button" disabled><span data-icon="download"></span>导出备份</button>
+                <button id="import-backup" class="secondary" type="button" disabled><span data-icon="upload"></span>导入备份</button>
+                <input id="backup-file" type="file" accept=".json,application/json" hidden>
+              </div>
+              <p id="backup-detail" class="fine">连接管理接口后可导出、导入。</p>
+              <p class="fine">备份包含权限、额度、价格、历史用量及密钥标识数据，不包含宿主配置或 API 密钥明文，请妥善保存。导入会覆盖当前插件数据，并先在数据目录保存回退备份；恢复后需检查数据并重新开启拦截。</p>
+              <p class="fine">Docker 更新前，建议将插件 data-dir 挂载到宿主机目录或数据卷；导出文件请保存到容器之外。</p>
+              <p id="backup-result" class="fine" role="status"></p>
+            </div>
+          </section>
           <form id="credential-form" class="settings-section" aria-labelledby="settings-credential-title">
             <div class="settings-aside">
               <div class="settings-aside-title"><h2 id="settings-credential-title">管理密钥</h2><span id="credential-status" class="badge warn">尚未连接</span></div>

@@ -282,6 +282,87 @@ impl Engine {
         hmac.update(key.trim().as_bytes());
         hex::encode(hmac.finalize().into_bytes())
     }
+    pub fn export_backup(&mut self) -> Result<Value> {
+        crate::backup::export(&mut self.db)
+    }
+    fn prepare_backup(&self, value: Value) -> Result<Self> {
+        let db = crate::backup::prepare(value)?;
+        let secret: String =
+            db.query_row("SELECT value FROM meta WHERE name='secret'", [], |r| {
+                r.get(0)
+            })?;
+        let mut restored = Self {
+            config: self.config.clone(),
+            db,
+            secret: secret.into_bytes(),
+            keys: BTreeMap::new(),
+            source_hash: String::new(),
+            aliases: BTreeMap::new(),
+            source_error: None,
+            health_error: None,
+            price_sync: None,
+        };
+        restored.sync()?;
+        restored.snapshot(Utc::now())?;
+        Ok(restored)
+    }
+    pub fn validate_backup(&self, value: Value) -> Result<Value> {
+        let restored = self.prepare_backup(value)?;
+        crate::backup::summary(&restored.db)
+    }
+    pub fn import_backup(&mut self, value: Value, confirmed: bool) -> Result<Value> {
+        if !confirmed {
+            return Err(Fault::new(
+                400,
+                "backup_confirmation_required",
+                "请确认覆盖当前插件数据后再导入",
+            ));
+        }
+        if self.enforcement_enabled()? {
+            return Err(Fault::new(
+                409,
+                "backup_enforcement_enabled",
+                "请先关闭请求拦截并暂停客户端请求，再导入备份",
+            ));
+        }
+        let restored = self.prepare_backup(value)?;
+        restored.db.execute(
+            "UPDATE meta SET value='false' WHERE name='enforcement_enabled'",
+            [],
+        )?;
+        restored.db.execute(
+            "UPDATE requests SET status='review' WHERE status='pending'",
+            [],
+        )?;
+        restored.db.execute(
+            "INSERT INTO audit(created,action,subject,detail) VALUES(?1,'backup_import','database','')",
+            [Utc::now().timestamp_millis()],
+        )?;
+        let had_worker = self.price_sync.is_some();
+        drop(self.price_sync.take());
+        let result = (|| {
+            let current = self.export_backup()?;
+            let rollback = crate::backup::save_rollback(&self.config.data_dir, &current)?;
+            crate::backup::replace(&mut self.db, &restored.db)?;
+            Ok::<_, Fault>(rollback)
+        })();
+        if result.is_ok() {
+            self.secret = restored.secret;
+            self.keys = restored.keys;
+            self.source_hash = restored.source_hash;
+            self.aliases = restored.aliases;
+            self.source_error = None;
+            self.health_error = None;
+        }
+        if had_worker {
+            self.price_sync = Some(crate::price_sync::Worker::start(
+                self.config.clone(),
+                crate::price_sync::Status::default(),
+            ));
+        }
+        let rollback = result?;
+        Ok(json!({"ok":true,"rollback_file":rollback,"summary":crate::backup::summary(&self.db)?}))
+    }
     fn timezone_setting(&self) -> Result<Option<String>> {
         Ok(self
             .db

@@ -1,5 +1,6 @@
 //! Native CLIProxyAPI plugin, C ABI v1 / RPC schema v6.
 pub mod accounting;
+mod backup;
 pub mod channel;
 pub mod config;
 pub mod engine;
