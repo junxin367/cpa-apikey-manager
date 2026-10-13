@@ -126,10 +126,14 @@ pub fn normalize(d: &Detail, provider: &str, executor: &str) -> Result<Tokens> {
     } else {
         d.cached_tokens
     };
-    let independent = (semantics.contains("claude") || semantics.contains("anthropic"))
-        && !semantics.contains("openaicompatexecutor")
-        && !semantics.contains("openai-compatible");
-    let separate_reasoning = ["gemini", "vertex", "antigravity"]
+    let compatible =
+        semantics.contains("openaicompatexecutor") || semantics.contains("openai-compatible");
+    // CPA's Devin executor counts cache reads inside InputTokens and TotalTokens, but
+    // reports cache writes outside both.
+    let devin = semantics.contains("devin") && !compatible;
+    let independent =
+        !devin && (semantics.contains("claude") || semantics.contains("anthropic")) && !compatible;
+    let separate_reasoning = ["gemini", "vertex", "antigravity", "aistudio"]
         .iter()
         .any(|s| semantics.contains(s));
     let subset = [
@@ -145,8 +149,15 @@ pub fn normalize(d: &Detail, provider: &str, executor: &str) -> Result<Tokens> {
     ]
     .iter()
     .any(|s| semantics.contains(s));
+    // Without cache or reasoning buckets, every token protocol reads the counts the same way.
+    let plain = d.reasoning_tokens == 0
+        && d.cached_tokens == 0
+        && d.cache_read_tokens == 0
+        && d.cache_creation_tokens == 0;
     let input = if independent {
         d.input_tokens
+    } else if devin {
+        d.input_tokens - read
     } else {
         d.input_tokens - read - d.cache_creation_tokens
     };
@@ -165,7 +176,7 @@ pub fn normalize(d: &Detail, provider: &str, executor: &str) -> Result<Tokens> {
     };
     // Anthropic-style upstreams may report total_tokens without cache creation;
     // the itemized counts are authoritative for billing.
-    let total = if independent
+    let total = if (independent || devin)
         && d.cache_creation_tokens > 0
         && total == expected - d.cache_creation_tokens
     {
@@ -179,7 +190,7 @@ pub fn normalize(d: &Detail, provider: &str, executor: &str) -> Result<Tokens> {
         cache_read: read,
         cache_write: d.cache_creation_tokens,
         total,
-        complete: (independent || separate_reasoning || subset)
+        complete: (independent || devin || separate_reasoning || subset || plain)
             && input >= 0
             && expected == total
             && (separate_reasoning || d.reasoning_tokens <= output),
@@ -447,6 +458,47 @@ mod tests {
     }
 
     #[test]
+    fn devin_cache_writes_outside_input_still_complete() {
+        // CPA DevinExecutor: InputTokens = uncached + cache read; TotalTokens omits cache writes.
+        let detail = Detail {
+            input_tokens: 562,
+            output_tokens: 1,
+            cached_tokens: 558,
+            cache_read_tokens: 558,
+            cache_creation_tokens: 109,
+            total_tokens: 563,
+            ..Detail::default()
+        };
+        let tokens = normalize(&detail, "devin", "DevinExecutor").unwrap();
+        assert!(tokens.complete);
+        assert_eq!(tokens.total, 672);
+        assert_eq!(tokens.input, 4);
+        assert_eq!(tokens.cache_read, 558);
+        assert_eq!(tokens.cache_write, 109);
+
+        let first_turn = Detail {
+            input_tokens: 4,
+            output_tokens: 155,
+            cache_creation_tokens: 107_800,
+            total_tokens: 159,
+            ..Detail::default()
+        };
+        let tokens = normalize(&first_turn, "devin", "DevinExecutor").unwrap();
+        assert!(tokens.complete);
+        assert_eq!((tokens.input, tokens.total), (4, 107_959));
+
+        let mut broken = detail.clone();
+        broken.total_tokens = 500;
+        assert!(
+            !normalize(&broken, "devin", "DevinExecutor")
+                .unwrap()
+                .complete
+        );
+
+        assert!(!normalize(&detail, "openai", "codex").unwrap().complete);
+    }
+
+    #[test]
     fn claude_total_without_cache_creation_still_completes() {
         let detail = Detail {
             input_tokens: 4,
@@ -456,16 +508,36 @@ mod tests {
             total_tokens: 563,
             ..Detail::default()
         };
-        let tokens = normalize(&detail, "devin", "claude").unwrap();
+        let tokens = normalize(&detail, "claude", "ClaudeExecutor").unwrap();
         assert!(tokens.complete);
         assert_eq!(tokens.total, 672);
-        assert_eq!(tokens.input, 4);
-        assert_eq!(tokens.cache_write, 109);
+    }
 
-        let mut broken = detail.clone();
-        broken.total_tokens = 500;
-        assert!(!normalize(&broken, "devin", "claude").unwrap().complete);
+    #[test]
+    fn host_semantics_cover_aistudio_and_plain_unknown_usage() {
+        let gemini = Detail {
+            input_tokens: 100,
+            output_tokens: 10,
+            reasoning_tokens: 5,
+            cache_read_tokens: 40,
+            total_tokens: 115,
+            ..Detail::default()
+        };
+        let tokens = normalize(&gemini, "aistudio", "AIStudioExecutor").unwrap();
+        assert!(tokens.complete);
+        assert_eq!((tokens.input, tokens.output), (60, 15));
 
-        assert!(!normalize(&detail, "openai", "codex").unwrap().complete);
+        let plain = Detail {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            ..Detail::default()
+        };
+        assert!(normalize(&plain, "meta", "MetaExecutor").unwrap().complete);
+        let cached = Detail {
+            cache_read_tokens: 4,
+            ..plain
+        };
+        assert!(!normalize(&cached, "meta", "MetaExecutor").unwrap().complete);
     }
 }

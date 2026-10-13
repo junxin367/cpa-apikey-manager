@@ -1556,14 +1556,14 @@ function settle(item, count) {
     fields[name] = el("input", { type: "number", min: "0", step: "1", max: "9000000000000000", required: true, value: "0" }); grid.append(field(label, fields[name]));
   }
   const tier = dropdown([["", "未知（按适用费率上限）"], ["standard", "标准服务"], ["priority", "fast / priority"], ["flex", "flex"], ["batch", "batch"], ["ultrafast", "ultrafast"]], "", "核对请求服务等级");
-  modal("处理待核对", [el("p", {}, item.model + " · 尚有 " + count + " 个请求待处理"), el("p", { class: "fine" }, "当前请求：" + item.request_id), grid, field("服务等级", tier.root), el("p", { class: "fine" }, "请按上游实际用量和服务等级核对；缺少对应服务等级费率时需先补齐模型价格。之后收到真实用量时，将修正人工记录。")], async () => {
+  modal("处理待核对", [el("p", {}, item.model + " · 尚有 " + count + " 个请求待处理"), el("p", { class: "fine" }, "当前请求：" + item.request_id), grid, field("服务等级", tier.root), el("p", { class: "fine" }, "待核对请求不会阻止密钥调用，核对后计入额度。请按上游实际用量和服务等级核对；缺少对应服务等级费率时需先补齐模型价格。之后收到真实用量时，将修正人工记录。")], async () => {
     const tokens = Object.fromEntries(Object.entries(fields).map(([key, node]) => [key, Number(node.value)]));
     if (Object.values(tokens).some((v) => !Number.isSafeInteger(v) || v < 0)) throw new Error("Token 必须为有效的非负整数");
     tokens.total = tokens.input + tokens.output + tokens.cache_read + tokens.cache_write; tokens.complete = true;
     tokens.service_tier = tier.value || null;
     await api("/settle", "POST", { request_id: item.request_id, model: item.model, tokens });
     await load(true); notify("已核对该请求");
-  }, "确认用量并恢复", "alert");
+  }, "确认用量", "alert");
 }
 document.querySelectorAll("[data-view]").forEach((button) => button.onclick = () => setView(button.dataset.view));
 function openEnforcementSettings() {

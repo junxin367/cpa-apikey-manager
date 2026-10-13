@@ -994,13 +994,8 @@ impl Engine {
             let timezone_label = self.timezone_name()?;
             let (start, end) = accounting::period_bounds(now, timezone, &policy.period)?;
             let totals = self.scope_totals(&key, *scope, start, end)?;
-            let review = totals["review"].as_i64().unwrap_or(0);
-            if review > 0 {
-                return Err(Fault::new(503, "usage_needs_review", format!(
-                    "请求被拒绝：{}有 {review} 个请求的用量或计费规则待核对，无法核算额度。请核对模型价格，并在「API 密钥」对应额度区域中点击「处理待核对」。", scope.subject())));
-            }
             let used = if quota.unit == "money" {
-                // Unpriced usage counts once its model has a price; it never blocks requests.
+                // Unpriced or review usage counts once priced or settled; it never blocks requests.
                 totals["cost_micros"].as_i64().unwrap_or(0)
             } else {
                 totals["tokens"]
@@ -2373,12 +2368,10 @@ mod key_reveal_tests {
         ).unwrap();
         assert_eq!(cost, None);
         assert_eq!(status, "review");
+        // Review waits for reconciliation and never blocks new requests.
         assert_eq!(
-            engine
-                .intercept(&request("tier-3"), true, now)
-                .unwrap_err()
-                .code,
-            "usage_needs_review"
+            engine.intercept(&request("tier-3"), true, now).unwrap(),
+            json!({})
         );
 
         assert_eq!(engine.save_price(model, price, 2).unwrap()["backfilled"], 1);
@@ -2388,10 +2381,6 @@ mod key_reveal_tests {
         ).unwrap();
         assert_eq!(cost, 1_760);
         assert_eq!(status, "settled");
-        assert_eq!(
-            engine.intercept(&request("tier-3"), true, now).unwrap(),
-            json!({})
-        );
         let unchanged: i64 = engine
             .db
             .query_row(
@@ -2401,6 +2390,81 @@ mod key_reveal_tests {
             )
             .unwrap();
         assert_eq!(unchanged, 440);
+        fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
+    fn devin_usage_settles_and_review_never_blocks() {
+        let raw_key = "sk-devin-review-test";
+        let (mut engine, config_path) = synced_engine(raw_key);
+        let model = "devin/claude-opus-5-5";
+        let mut policy = Policy {
+            rule_mode: "channel".into(),
+            ..Policy::default()
+        };
+        policy.channel_rules.insert(
+            "claude".into(),
+            Rule {
+                access: "allow".into(),
+                quota: Some(Quota {
+                    unit: "money".into(),
+                    limit: "50".into(),
+                }),
+            },
+        );
+        store_policy(&engine, &policy);
+        let price = serde_json::from_value(
+            json!({"input":"4","output":"20","cache_read":"0.2","cache_write":"5"}),
+        )
+        .unwrap();
+        engine.save_price(model, price, 0).unwrap();
+        let scope = crate::config::caller_scope(raw_key);
+        let request = |rid: &str| {
+            json!({"RequestID":rid,"TraceID":format!("trace-{rid}"),"Model":model,
+                "RequestedModel":model,"Metadata":{"caller_scope":scope}})
+        };
+        let settled = |engine: &Engine, rid: &str| -> (Option<i64>, String) {
+            engine
+                .db
+                .query_row(
+                    "SELECT u.cost,r.status FROM usage u JOIN requests r ON r.request_id=u.request_id
+                     WHERE r.request_id=?1",
+                    [rid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        let now = Utc::now();
+
+        // CPA DevinExecutor publishes its own execution ID, cache writes outside InputTokens
+        // and TotalTokens, and no served tier.
+        engine.intercept(&request("devin-1"), true, now).unwrap();
+        engine
+            .usage(
+                &json!({"RequestID":"execution-1","TraceID":"trace-devin-1","APIKey":raw_key,
+                    "Model":model,"Provider":"devin","ExecutorType":"DevinExecutor","ServiceTier":"auto",
+                    "Detail":{"InputTokens":4,"OutputTokens":155,"CacheCreationTokens":107800,"TotalTokens":159}}),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            settled(&engine, "devin-1"),
+            (Some(542_116), "settled".into())
+        );
+
+        engine.intercept(&request("devin-2"), true, now).unwrap();
+        engine
+            .usage(
+                &json!({"RequestID":"devin-2","APIKey":raw_key,"Model":model,"Provider":"mystery",
+                    "Detail":{"InputTokens":10,"OutputTokens":1,"CacheReadTokens":5,"TotalTokens":11}}),
+                now,
+            )
+            .unwrap();
+        assert_eq!(settled(&engine, "devin-2"), (None, "review".into()));
+        assert_eq!(
+            engine.intercept(&request("devin-3"), true, now).unwrap(),
+            json!({})
+        );
         fs::remove_file(config_path).unwrap();
     }
 
