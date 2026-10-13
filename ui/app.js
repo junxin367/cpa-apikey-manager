@@ -1555,7 +1555,7 @@ function settle(item, count) {
   for (const [name, label] of [["input", "普通输入 Token"], ["output", "输出 Token"], ["cache_read", "缓存读取 Token"], ["cache_write", "缓存写入 Token"]]) {
     fields[name] = el("input", { type: "number", min: "0", step: "1", max: "9000000000000000", required: true, value: "0" }); grid.append(field(label, fields[name]));
   }
-  const tier = dropdown([["", "未知（按适用费率上限）"], ["standard", "标准服务"], ["priority", "fast / priority"], ["flex", "flex"], ["batch", "batch"], ["ultrafast", "ultrafast"]], "", "核对请求服务等级");
+  const tier = dropdown([["", "未报告 / auto（按标准价）"], ["standard", "标准服务"], ["priority", "fast / priority"], ["flex", "flex"], ["batch", "batch"], ["ultrafast", "ultrafast"]], "", "核对请求服务等级");
   modal("处理待核对", [el("p", {}, item.model + " · 尚有 " + count + " 个请求待处理"), el("p", { class: "fine" }, "当前请求：" + item.request_id), grid, field("服务等级", tier.root), el("p", { class: "fine" }, "待核对请求不会阻止密钥调用，核对后计入额度。请按上游实际用量和服务等级核对；缺少对应服务等级费率时需先补齐模型价格。之后收到真实用量时，将修正人工记录。")], async () => {
     const tokens = Object.fromEntries(Object.entries(fields).map(([key, node]) => [key, Number(node.value)]));
     if (Object.values(tokens).some((v) => !Number.isSafeInteger(v) || v < 0)) throw new Error("Token 必须为有效的非负整数");

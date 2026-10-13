@@ -317,32 +317,14 @@ impl Price {
         }
         let input = tokens.input + tokens.cache_read + tokens.cache_write;
         let tier = tokens.service_tier.as_deref().and_then(service_tier);
-        let tiers = match tier.as_deref() {
-            Some("standard") => vec![None],
-            Some(tier) => vec![Some(tier)],
-            None => {
-                let mut tiers = vec![None];
-                for rule in &self.rules {
-                    if let Some(tier) = rule.service_tier.as_deref() {
-                        if !tiers.contains(&Some(tier)) {
-                            tiers.push(Some(tier));
-                        }
-                    }
-                }
-                tiers
-            }
-        };
-        let mut sum = 0;
-        for tier in tiers {
-            let rates = self.rates_for(input, tier)?;
-            let cost = counts
-                .iter()
-                .zip(rates)
-                .map(|(count, rate)| i128::from(*count) * i128::from(rate))
-                .sum();
-            // Older hosts cannot report the served tier; never assume the cheapest one.
-            sum = sum.max(cost);
-        }
+        // auto or absent telemetry is not evidence that a premium service tier was served.
+        let tier = tier.as_deref().filter(|tier| *tier != "standard");
+        let rates = self.rates_for(input, tier)?;
+        let sum: i128 = counts
+            .iter()
+            .zip(rates)
+            .map(|(count, rate)| i128::from(*count) * i128::from(rate))
+            .sum();
         let value = (sum + i128::from(SCALE) - 1) / i128::from(SCALE);
         i64::try_from(value)
             .ok()
@@ -419,9 +401,22 @@ mod tests {
             price.cost(&tokens(272_001, Some("priority"))).unwrap(),
             11_030_040
         );
-        assert_eq!(price.cost(&tokens(1_000, None)).unwrap(), 120_000);
-        assert_eq!(price.cost(&tokens(272_001, None)).unwrap(), 11_030_040);
+        assert_eq!(price.cost(&tokens(1_000, None)).unwrap(), 60_000);
+        assert_eq!(price.cost(&tokens(272_001, None)).unwrap(), 5_515_020);
         assert!(price.cost(&tokens(1_000, Some("unknown"))).is_err());
+    }
+
+    #[test]
+    fn auto_and_missing_tiers_use_standard_rates() {
+        let mut price = price();
+        for tier in [None, Some(""), Some("auto"), Some(" AUTO ")] {
+            assert_eq!(price.cost(&tokens(1_000, tier)).unwrap(), 60_000);
+            assert_eq!(price.cost(&tokens(272_001, tier)).unwrap(), 5_515_020);
+        }
+        price.rules[1].input_tokens_above = Some(500_000);
+        assert_eq!(price.cost(&tokens(1_000, None)).unwrap(), 60_000);
+        assert_eq!(price.cost(&tokens(1_000, Some("auto"))).unwrap(), 60_000);
+        assert!(price.cost(&tokens(1_000, Some("priority"))).is_err());
     }
 
     #[test]
@@ -432,7 +427,7 @@ mod tests {
             price.cost(&tokens(272_001, Some("priority"))).unwrap(),
             5_540_020
         );
-        assert_eq!(price.cost(&tokens(272_001, None)).unwrap(), 5_540_020);
+        assert_eq!(price.cost(&tokens(272_001, None)).unwrap(), 5_515_020);
         assert_eq!(
             price.cost(&tokens(272_001, Some("standard"))).unwrap(),
             5_515_020

@@ -2469,6 +2469,89 @@ mod key_reveal_tests {
     }
 
     #[test]
+    fn devin_auto_replay_uses_standard_prices() {
+        let raw_key = "sk-auto-billing-test";
+        let (mut engine, config_path) = synced_engine(raw_key);
+        let model = "devin/claude-opus-5-5";
+        store_policy(
+            &engine,
+            &Policy {
+                total_quota_enabled: true,
+                total_quota: Some(Quota {
+                    unit: "money".into(),
+                    limit: "50".into(),
+                }),
+                ..Policy::default()
+            },
+        );
+        let price = serde_json::from_value(json!({
+            "input":"4", "output":"20", "cache_read":"0.2", "cache_write":"5",
+            "rules":[{"service_tier":"priority","input":"8","output":"40","cache_read":"0.4","cache_write":"10"}]
+        })).unwrap();
+        engine.save_price(model, price, 0).unwrap();
+        let scope = crate::config::caller_scope(raw_key);
+        let now = Utc::now();
+        let records = [
+            (107800, 155, 0, 107796),
+            (115523, 202, 0, 115519),
+            (50600, 11, 0, 50596),
+            (115820, 256, 115519, 299),
+            (154844, 171, 115818, 39024),
+            (196342, 118, 154842, 41498),
+            (217557, 321, 196340, 21215),
+            (218073, 449, 217555, 514),
+            (219433, 295, 218069, 1362),
+            (221037, 2691, 219431, 1604),
+            (223940, 264, 221035, 2903),
+            (224213, 333, 223938, 273),
+            (225714, 245, 224211, 1501),
+            (226016, 240, 225712, 300),
+            (226471, 205, 226012, 457),
+            (226977, 4969, 226469, 506),
+            (232040, 107, 226975, 5061),
+        ];
+        for (index, (input, output, read, write)) in records.into_iter().enumerate() {
+            let rid = format!("auto-{index}");
+            engine
+                .intercept(
+                    &json!({
+                        "RequestID":rid,"Model":model,"RequestedModel":model,
+                        "Metadata":{"caller_scope":scope}
+                    }),
+                    true,
+                    now,
+                )
+                .unwrap();
+            // Manager's normalized input includes cache writes; CPA Devin UsageRecord does not.
+            let record = json!({
+                "RequestID":rid,"APIKey":raw_key,"Model":model,"Provider":"devin",
+                "ExecutorType":"DevinExecutor","ServiceTier":"auto",
+                "Detail":{"InputTokens":input-write,"OutputTokens":output,
+                    "CacheReadTokens":read,"CacheCreationTokens":write,"TotalTokens":input-write+output}
+            });
+            engine.usage(&record, now).unwrap();
+            engine.usage(&record, now).unwrap();
+        }
+        let key = engine.keys.values().next().unwrap().id.clone();
+        let totals = engine.totals(&key, "", 0, i64::MAX).unwrap();
+        assert_eq!(totals["cost"], "2.735354");
+        assert_eq!(totals["tokens"], "3213432");
+        assert_eq!(totals["requests"], 17);
+        assert_eq!(totals["review"], 0);
+        assert_eq!(totals["unpriced"], 0);
+        let first_cost: i64 = engine
+            .db
+            .query_row(
+                "SELECT cost FROM usage WHERE request_id='auto-0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_cost, 542_096);
+        fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
     fn channels_come_from_known_models_and_existing_rules() {
         let (mut engine, config_path) = synced_engine("sk-channel-list-test");
         let key = engine.keys.values().next().unwrap().id.clone();
