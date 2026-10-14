@@ -19,6 +19,8 @@ let revealAll = false;
 const revealedKeys = new Map();
 let keySearchTimer, keySearchSequence = 0;
 let remoteKeyMatches = new Set();
+// Key list order: "usage" lists the highest consumed-quota percentage first (the default); "host" keeps the host order.
+let keySortMode = "usage";
 let priceFilter = "all";
 const credentials = globalThis.CpaCredentials;
 const credentialHost = window.location.host, credentialAgent = navigator.userAgent;
@@ -50,6 +52,7 @@ function icon(name) {
     power: ["M12 2v10", "M18.4 6.6a9 9 0 1 1-12.77.04"],
     undo: ["M9 14 4 9l5-5", "M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"],
     arrowRight: ["M5 12h14", "m12 5 7 7-7 7"],
+    arrowUpDown: ["m21 16-4 4-4-4", "M17 20V4", "m3 8 4-4 4 4", "M7 4v16"],
     chevronDown: ["m6 9 6 6 6-6"],
     download: ["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4", "m7 10 5 5 5-5", "M12 15V3"],
     upload: ["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4", "m7 8 5-5 5 5", "M12 3v12"],
@@ -775,6 +778,20 @@ function renderKeys() {
   const keys = snapshot.keys.filter((key) =>
     (key.masked + key.policy.note + (revealedKeys.get(key.id) || "")).toLowerCase().includes(search)
       || remoteKeyMatches.has(key.id));
+  // Consumption percentage shown on each card; higher means closer to the limit.
+  const usageRatio = (key) => {
+    const ratios = [];
+    if (key.policy.total_quota_enabled && key.policy.total_access !== "deny" && Number(key.policy.total_quota?.limit) > 0 && key.total_usage) ratios.push(Number(key.total_usage[key.policy.total_quota.unit === "money" ? "cost" : "tokens"] || 0) / Number(key.policy.total_quota.limit));
+    const channelMode = key.policy.rule_mode === "channel";
+    for (const [id, rule] of Object.entries(activeRules(key.policy))) {
+      if (rule.access === "deny" || !rule.quota || !(Number(rule.quota.limit) > 0)) continue;
+      const usage = channelMode ? key.channel_usage?.[id] : key.quotas?.[id];
+      if (usage) ratios.push(Number(usage[rule.quota.unit === "money" ? "cost" : "tokens"] || 0) / Number(rule.quota.limit));
+    }
+    return ratios.length ? Math.max(...ratios) : 0;
+  };
+  // Array.prototype.sort is stable, so keys with the same percentage keep the host order.
+  if (keySortMode === "usage") keys.sort((left, right) => usageRatio(right) - usageRatio(left));
   const focused = document.activeElement?.closest?.("#key-list .key-card")?.dataset.keyId;
   $("key-list").replaceChildren(...keys.map((key) => {
     const raw = revealedKeys.get(key.id), note = key.policy.note;
@@ -1333,6 +1350,11 @@ $("key-list").addEventListener("keydown", (event) => {
   buttons[next].focus();
   revealCard(buttons[next].closest(".key-card"));
 });
+const keySortDropdown = dropdown([["usage", "用量百分比从高到低"], ["host", "宿主顺序"]], "usage", "排序方式");
+keySortDropdown.root.classList.add("key-sort");
+keySortDropdown.button.replaceChildren(icon("arrowUpDown"), "排序");
+$("key-sort-slot").replaceWith(keySortDropdown.root);
+keySortDropdown.onchange = (value) => { keySortMode = value; keySortDropdown.button.classList.toggle("active", value !== "usage"); renderKeys(); };
 $("reveal-all-keys").onclick = () => guard(async () => {
   const activeKeys = snapshot?.keys.filter((key) => key.active) || [];
   if (activeKeys.length === 0) return;
