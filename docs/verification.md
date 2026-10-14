@@ -6,7 +6,7 @@
 
 所有模型推理使用本机模拟上游和临时密钥，没有调用收费模型，也未修改用户已有部署。基线价格目录同时进行了可控模拟和真实公开 GET 验证。以下分别记录新增功能和原有基线，基线宿主与浏览器结果不代表已对新版本重复验收。
 
-## v0.6.7 密钥列表排序（2026-10-14）
+## v0.6.8 密钥列表排序（2026-10-14）
 
 - 变更：密钥列表标题区在“查看完整／隐藏完整”左侧新增“排序”下拉，默认“用量百分比从高到低”，可切换“宿主顺序”。用量百分比取每个密钥各额度中已用比例的最大值，与卡片进度条一致；没有额度或“全部模型禁止”的密钥按 0% 处理并排在最后，比例相同的密钥保持宿主顺序，已删除密钥同样参与。排序在搜索过滤之后应用，刷新数据和切换页面后保持，重新打开页面恢复默认。
 - 范围：只改变前端展示顺序，不改变宿主密钥、权限、额度、记账和管理接口。
@@ -15,9 +15,9 @@
 ### 验证
 
 - `cargo fmt --check` 与 `cargo test --locked`（49 项）通过；`cargo metadata --locked` 通过，`Cargo.lock` 仅修改本项目版本号，没有更新依赖。
-- `node --check` 检查 `ui/app.js`、`ui/credentials.js` 与 `scripts/release.mjs` 通过；`node --test ui/credentials.test.mjs`（4 项）通过；`node scripts/release.mjs registry` 输出 `cpa-apikey-manager@0.6.7`；`git diff --check` 通过。
+- `node --check` 检查 `ui/app.js`、`ui/credentials.js` 与 `scripts/release.mjs` 通过；`node --test ui/credentials.test.mjs`（4 项）通过；`node scripts/release.mjs registry` 输出 `cpa-apikey-manager@0.6.8`；`git diff --check` 通过。
 - Chrome 页面验收全部通过，页面无运行时错误。验收使用本地 `ui/` 文件和模拟管理接口（请求拦截实现，未启动宿主服务），确认默认按百分比降序、并列比例保持宿主顺序、多额度取最大比例（80% 而不是卡片进度条的 50%）、切换宿主顺序后恢复，以及 1440、1180、1024、390 宽度下标题区不重叠、菜单完整可点击、键盘操作与搜索组合。
-- `scripts/build.ps1 -ReleaseAssets` 生成 `cpa-apikey-manager_0.6.7_windows_amd64.zip`。包内 `cpa-apikey-manager.dll` 与 `target/release` 构建结果、`SHA256SUMS.txt` 一致，SHA-256 为 `e87e79345abc70b5fd4d9538de8903901222c5529f08cf9e809059baff972f0d`。
+- `scripts/build.ps1 -ReleaseAssets` 生成 `cpa-apikey-manager_0.6.8_windows_amd64.zip`。包内 `cpa-apikey-manager.dll` 与 `target/release` 构建结果、`SHA256SUMS.txt` 一致，SHA-256 为 `67c67ca2b562a14afe35e63f11bba5ac9e44118cc6e58fe2667b4953d531878e`。
 
 ### 未闭环项
 

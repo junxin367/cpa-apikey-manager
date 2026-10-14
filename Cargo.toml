@@ -1,6 +1,6 @@
 [package]
 name = "cpa-apikey-manager"
-version = "0.6.7"
+version = "0.6.8"
 edition = "2021"
 description = "CLIProxyAPI client API key model permissions and recurring quotas"
 license = "MIT"
