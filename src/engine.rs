@@ -1276,6 +1276,26 @@ impl Engine {
         tokens: Tokens,
         now: DateTime<Utc>,
     ) -> Result<()> {
+        self.settle_record(rid, model, tokens, None, now)
+    }
+    pub fn correct_manual(
+        &mut self,
+        rid: &str,
+        model: &str,
+        tokens: Tokens,
+        expected: (i64, i64),
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.settle_record(rid, model, tokens, Some(expected), now)
+    }
+    fn settle_record(
+        &mut self,
+        rid: &str,
+        model: &str,
+        tokens: Tokens,
+        expected: Option<(i64, i64)>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         if !tokens.complete
             || [
                 tokens.input,
@@ -1290,23 +1310,49 @@ impl Engine {
         {
             return Err("Token 明细必须非负且合计一致".into());
         }
-        let row: Option<(String, i64, Option<String>, String, String)> = self
+        let current_price = self.price(model)?;
+        let tx = self
             .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some((expected_tokens, expected_cost)) = expected {
+            let allowed: bool = tx.query_row(
+                "SELECT COUNT(*)=1 AND COALESCE(SUM(CASE WHEN manual=1 AND tokens=?3
+                    AND cost=?4 THEN 1 ELSE 0 END),0)=1
+                 FROM usage WHERE request_id=?1 AND model=?2",
+                params![rid, model, expected_tokens, expected_cost],
+                |row| row.get(0),
+            )?;
+            if !allowed {
+                return Err(Fault::new(
+                    409,
+                    "manual_settlement_changed",
+                    "该请求的人工结算已变化或已收到真实用量，请刷新后核对，未覆盖任何记录",
+                ));
+            }
+        }
+        let row: Option<(String, i64, Option<String>, String, String)> = tx
             .query_row(
                 "SELECT key_id,started,price,channel,legacy_channel FROM requests
-            WHERE request_id=?1 AND model=?2 AND status='review'",
-                params![rid, model],
+            WHERE request_id=?1 AND model=?2 AND status=?3",
+                params![
+                    rid,
+                    model,
+                    if expected.is_some() {
+                        "settled"
+                    } else {
+                        "review"
+                    }
+                ],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         let (key, started, price, request_channel, legacy_channel) =
-            row.ok_or("该请求不在待核对状态")?;
+            row.ok_or("该请求不在可核对或更正的状态")?;
         let price = price
             .map(|p| serde_json::from_str::<Price>(&p))
             .transpose()?
-            .or(self.price(model)?);
+            .or(current_price);
         let cost = price.map(|p| p.cost(&tokens)).transpose()?;
-        let tx = self.db.transaction()?;
         // Reconciliation explicitly replaces this request's existing incomplete totals.
         tx.execute(
             "DELETE FROM usage WHERE request_id=?1 AND model=?2",
@@ -1319,9 +1365,25 @@ impl Engine {
             "UPDATE requests SET status='settled' WHERE request_id=?1 AND model=?2",
             params![rid, model],
         )?;
+        let detail = expected
+            .map(|(previous_tokens, previous_cost)| {
+                json!({"previous_tokens":previous_tokens,"previous_cost_micros":previous_cost,
+                "tokens":tokens,"cost_micros":cost})
+                .to_string()
+            })
+            .unwrap_or_default();
         tx.execute(
-            "INSERT INTO audit(created,action,subject,detail) VALUES(?1,'settle',?2,?3)",
-            params![now.timestamp_millis(), rid, ""],
+            "INSERT INTO audit(created,action,subject,detail) VALUES(?1,?2,?3,?4)",
+            params![
+                now.timestamp_millis(),
+                if expected.is_some() {
+                    "correct_manual"
+                } else {
+                    "settle"
+                },
+                rid,
+                detail
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -2597,6 +2659,84 @@ mod key_reveal_tests {
         assert_eq!(old["targets"], json!([base]));
         assert_eq!(old["price_model"], base);
         assert_eq!(old["channel"], "claude");
+        let measured = crate::accounting::Tokens {
+            input: 100,
+            output: 10,
+            total: 110,
+            complete: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            engine
+                .correct_manual(
+                    "thinking-admission",
+                    variant,
+                    measured.clone(),
+                    (110, 300),
+                    now
+                )
+                .unwrap_err()
+                .code,
+            "manual_settlement_changed"
+        );
+        let mut manual_request = request.clone();
+        manual_request["RequestID"] = json!("manual-admission");
+        manual_request["TraceID"] = json!("manual-trace");
+        engine.intercept(&manual_request, true, now).unwrap();
+        engine
+            .db
+            .execute(
+                "UPDATE requests SET status='review' WHERE request_id='manual-admission'",
+                [],
+            )
+            .unwrap();
+        engine
+            .settle(
+                "manual-admission",
+                base,
+                crate::accounting::Tokens {
+                    complete: true,
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap();
+        engine
+            .correct_manual("manual-admission", base, measured.clone(), (0, 0), now)
+            .unwrap();
+        assert_eq!(
+            engine
+                .correct_manual("manual-admission", base, measured, (0, 0), now)
+                .unwrap_err()
+                .code,
+            "manual_settlement_changed"
+        );
+        let corrected: (i64, i64, bool) = engine
+            .db
+            .query_row(
+                "SELECT tokens,cost,manual FROM usage WHERE request_id='manual-admission'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(corrected, (110, 300, true));
+        let mut authoritative = record.clone();
+        authoritative["RequestID"] = json!("manual-execution");
+        authoritative["TraceID"] = json!("manual-trace");
+        engine.usage(&authoritative, now).unwrap();
+        engine.usage(&authoritative, now).unwrap();
+        let final_usage: (i64, i64, bool) = engine.db.query_row(
+            "SELECT COUNT(*),SUM(cost),MAX(manual) FROM usage WHERE request_id='manual-admission'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+        ).unwrap();
+        assert_eq!(final_usage, (1, 300, false));
+        assert_eq!(
+            engine.db.query_row(
+                "SELECT COUNT(*) FROM audit WHERE action='correct_manual' AND subject='manual-admission'",
+                [], |row| row.get::<_, i64>(0)
+            ).unwrap(),
+            1
+        );
         fs::remove_file(config_path).unwrap();
     }
 

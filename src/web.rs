@@ -249,12 +249,31 @@ fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
             Ok(json!({"model":model}))
         }
         ("POST", "/settle") => {
-            engine.settle(
-                required("request_id")?,
-                required("model")?,
-                serde_json::from_value::<Tokens>(data["tokens"].clone())?,
-                Utc::now(),
-            )?;
+            let tokens = serde_json::from_value::<Tokens>(data["tokens"].clone())?;
+            if let Some(expected) = data.get("expected_manual") {
+                let total = expected["tokens"]
+                    .as_i64()
+                    .filter(|value| *value >= 0)
+                    .ok_or("缺少有效的原人工结算 Token 数")?;
+                let cost = expected["cost_micros"]
+                    .as_i64()
+                    .filter(|value| *value >= 0)
+                    .ok_or("缺少有效的原人工结算费用")?;
+                engine.correct_manual(
+                    required("request_id")?,
+                    required("model")?,
+                    tokens,
+                    (total, cost),
+                    Utc::now(),
+                )?;
+            } else {
+                engine.settle(
+                    required("request_id")?,
+                    required("model")?,
+                    tokens,
+                    Utc::now(),
+                )?;
+            }
             Ok(json!({"ok":true}))
         }
         _ => Err(Fault::new(404, "not_found", "接口不存在")),
