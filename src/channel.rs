@@ -42,6 +42,35 @@ pub fn legacy(upstream_format: Option<&str>) -> &'static str {
     }
 }
 
+pub fn base_model(model: &str) -> &str {
+    let Some((base, suffix)) = model.strip_suffix(')').and_then(|s| s.rsplit_once('(')) else {
+        return model;
+    };
+    let suffix = suffix.trim().to_ascii_lowercase();
+    if !base.is_empty()
+        && (matches!(
+            suffix.as_str(),
+            "none"
+                | "off"
+                | "disabled"
+                | "minimal"
+                | "low"
+                | "medium"
+                | "high"
+                | "xhigh"
+                | "max"
+                | "auto"
+                | "adaptive"
+                | "thinking"
+                | "fast"
+        ) || suffix.parse::<u32>().is_ok())
+    {
+        base
+    } else {
+        model
+    }
+}
+
 pub fn classify(model: &str) -> String {
     let name = model
         .rsplit('/')
@@ -140,6 +169,25 @@ impl<'a> Scope<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_suffixes_do_not_change_model_identity() {
+        for suffix in ["medium", "HIGH", "auto", "8192"] {
+            assert_eq!(
+                base_model(&format!("devin/claude-sonnet-5-5({suffix})")),
+                "devin/claude-sonnet-5-5"
+            );
+        }
+        for model in [
+            "devin/claude-sonnet-5-5",
+            "claude-sonnet-5-5-high",
+            "gpt-5.5-fast",
+            "model(custom)",
+            "model(medium",
+        ] {
+            assert_eq!(base_model(model), model);
+        }
+    }
 
     #[test]
     fn upstream_rules_are_separate_from_model_channels() {

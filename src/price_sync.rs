@@ -367,11 +367,11 @@ fn synchronize(
             let model = row.map_err(storage)?;
             match source_config.aliases.get(&model) {
                 Some(targets) if targets.len() == 1 => {
-                    names.insert(targets[0].clone());
+                    names.insert(crate::channel::base_model(&targets[0]).to_string());
                 }
                 Some(_) => {} // A routing alias with multiple targets has no single safe price.
                 None => {
-                    names.insert(model);
+                    names.insert(crate::channel::base_model(&model).to_string());
                 }
             }
         }

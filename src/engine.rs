@@ -538,6 +538,17 @@ impl Engine {
         for model in source.models {
             tx.execute("INSERT OR IGNORE INTO models(id) VALUES(?1)", [model])?;
         }
+        let known_models = {
+            let mut statement = tx.prepare("SELECT id FROM models")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for model in known_models {
+            let base = channel::base_model(&model);
+            if base != model {
+                tx.execute("INSERT OR IGNORE INTO models(id) VALUES(?1)", [base])?;
+            }
+        }
         tx.commit()?;
         self.keys = keys.into_iter().collect();
         self.aliases = source.aliases;
@@ -571,12 +582,13 @@ impl Engine {
         decode_policy(&text.ok_or_else(|| Fault::new(404, "key_not_found", "密钥不存在"))?)
     }
     pub fn price(&self, model: &str) -> Result<Option<Price>> {
-        stored_price(&self.db, model)
+        stored_price(&self.db, &self.canonical(model))
     }
     fn canonical(&self, model: &str) -> String {
-        match self.aliases.get(model) {
-            Some(targets) if targets.len() == 1 => targets[0].clone(),
-            _ => model.to_string(),
+        let base = channel::base_model(model);
+        match self.aliases.get(model).or_else(|| self.aliases.get(base)) {
+            Some(targets) if targets.len() == 1 => channel::base_model(&targets[0]).to_string(),
+            _ => base.to_string(),
         }
     }
     /// Only channels identified from known models can receive new rules.
@@ -607,24 +619,45 @@ impl Engine {
             end,
         )
     }
+    fn model_scope_values(&self, model: &str) -> Result<String> {
+        if model.is_empty() {
+            return Ok("[]".to_string());
+        }
+        let base = channel::base_model(model);
+        let mut models = BTreeSet::from([base.to_string(), model.to_string()]);
+        let mut statement = self.db.prepare("SELECT id FROM models")?;
+        for id in statement.query_map([], |row| row.get::<_, String>(0))? {
+            let id = id?;
+            if channel::base_model(&id) == base {
+                models.insert(id);
+            }
+        }
+        Ok(serde_json::to_string(&models)?)
+    }
     fn scope_totals(&self, key: &str, scope: Scope<'_>, start: i64, end: i64) -> Result<Value> {
-        let filter = scope.filter();
-        let value = scope.value();
+        let (filter, value) = if let Scope::Model(model) = scope {
+            (
+                "model IN (SELECT value FROM json_each(?2))",
+                self.model_scope_values(model)?,
+            )
+        } else {
+            (scope.filter(), scope.value().to_string())
+        };
         let (tokens, cost, unpriced, count): (i64, i64, i64, i64) = self.db.query_row(
             &format!(
                 "SELECT COALESCE(SUM(tokens),0),COALESCE(SUM(cost),0),
              COALESCE(SUM(CASE WHEN cost IS NULL THEN 1 ELSE 0 END),0),COUNT(*)
              FROM usage WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4"
             ),
-            params![key, value, start, end],
+            params![key, &value, start, end],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         let pending: i64 = self.db.query_row(
             &format!("SELECT COUNT(*) FROM requests WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4 AND status IN ('pending','review')"),
-            params![key, value, start, end], |r| r.get(0))?;
+            params![key, &value, start, end], |r| r.get(0))?;
         let review: i64 = self.db.query_row(
             &format!("SELECT COUNT(*) FROM requests WHERE key_id=?1 AND {filter} AND ?2 IS NOT NULL AND status='review'"),
-            params![key, value],
+            params![key, &value],
             |r| r.get(0),
         )?;
         Ok(
@@ -850,9 +883,15 @@ impl Engine {
                 .get(actual_channel)
                 .is_some_and(|rule| rule.access == "deny");
         }
-        let rules: Vec<_> = [requested, actual]
+        let rules: Vec<_> = policy
+            .rules
             .iter()
-            .filter_map(|m| policy.rules.get(*m))
+            .filter(|(model, _)| {
+                [requested, actual]
+                    .iter()
+                    .any(|name| channel::base_model(model) == channel::base_model(name))
+            })
+            .map(|(_, rule)| rule)
             .collect();
         if rules.iter().any(|r| r.access == "deny") {
             return false;
@@ -953,7 +992,7 @@ impl Engine {
             return Ok(json!({}));
         }
         let actual = if after {
-            string(req, "Model").unwrap_or(requested).to_string()
+            channel::base_model(string(req, "Model").unwrap_or(requested)).to_string()
         } else {
             self.canonical(requested)
         };
@@ -985,7 +1024,7 @@ impl Engine {
             .into_iter()
             .filter(|(scope, _)| match scope {
                 Scope::Total => true,
-                Scope::Model(id) => *id == actual,
+                Scope::Model(id) => channel::base_model(id) == actual,
                 Scope::Channel(id) => *id == actual_channel || *id == legacy_channel,
             })
             .collect();
@@ -1101,11 +1140,10 @@ impl Engine {
             .is_some_and(|policy| !policy.enforcement_configured())
         {
             let admitted: bool = self.db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM requests WHERE key_id=?4 AND model=?2
-                 AND (request_id=?1 OR (?3<>'' AND trace_id=?3)))",
+                "SELECT EXISTS(SELECT 1 FROM requests WHERE key_id=?3
+                 AND (request_id=?1 OR (?2<>'' AND trace_id=?2)))",
                 params![
                     string(record, "RequestID").unwrap_or(""),
-                    string(record, "Model").unwrap_or(""),
                     string(record, "TraceID").unwrap_or(""),
                     fallback_key
                 ],
@@ -1122,25 +1160,46 @@ impl Engine {
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.timestamp_millis())
             .unwrap_or(now.timestamp_millis());
-        let exact: Option<(String,i64,Option<String>,String,String,String)> = self.db.query_row(
-            "SELECT key_id,started,price,request_id,channel,legacy_channel FROM requests WHERE request_id=?1 AND model=?2",
-            params![rid,model], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
-        let pending = match exact {
-            Some(value) => Some(value),
-            None if !trace.is_empty() && fallback_key.is_some() => self.db.query_row(
-                "SELECT key_id,started,price,request_id,channel,legacy_channel FROM requests WHERE trace_id=?1 AND model=?2 AND key_id=?3
-                 AND ABS(started-?4)<86400000 ORDER BY started DESC LIMIT 1",
-                params![trace,model,fallback_key,requested_at], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?,
-            _ => None,
-        };
-        let (key, started, price, parent_id, request_channel, legacy_channel) = match pending {
-            Some(pending) => pending,
-            None => {
-                // Never infer an earlier admission from today's policy. No credentials in diagnostics.
-                eprintln!("cpa-apikey-manager: 忽略无法关联准入记录的用量通知");
-                return Ok(());
+        let pending = {
+            let mut statement = self.db.prepare(
+                "SELECT key_id,started,price,request_id,channel,legacy_channel,model
+                 FROM requests WHERE (request_id=?1 AND (?4 IS NULL OR key_id=?4))
+                    OR (?3<>'' AND key_id=?4 AND trace_id=?3 AND ABS(started-?5)<86400000)
+                 ORDER BY (request_id=?1) DESC,(model=?2) DESC,started DESC",
+            )?;
+            let rows = statement.query_map(
+                params![rid, model, trace, fallback_key, requested_at],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                    ))
+                },
+            )?;
+            let mut matched = None;
+            for row in rows {
+                let row = row?;
+                if channel::base_model(&row.6) == channel::base_model(model) {
+                    matched = Some(row);
+                    break;
+                }
             }
+            matched
         };
+        let (key, started, price, parent_id, request_channel, legacy_channel, admitted_model) =
+            match pending {
+                Some(pending) => pending,
+                None => {
+                    // Never infer an earlier admission from today's policy. No credentials in diagnostics.
+                    eprintln!("cpa-apikey-manager: 忽略无法关联准入记录的用量通知");
+                    return Ok(());
+                }
+            };
         let detail: Detail =
             serde_json::from_value(record.get("Detail").cloned().unwrap_or(json!({})))?;
         let mut tokens = accounting::normalize(
@@ -1182,7 +1241,7 @@ impl Engine {
         // An admission without a price snapshot uses the price found since then.
         let price = match price {
             Some(price) => Some(price),
-            None => stored_price(&tx, model)?,
+            None => stored_price(&tx, &admitted_model)?,
         };
         let priced = price.as_ref().map(|p| p.cost(&tokens)).transpose();
         let needs_review = !tokens.complete || priced.is_err();
@@ -1190,20 +1249,23 @@ impl Engine {
         // A late authoritative record replaces a manual settlement, not a second debit.
         tx.execute(
             "DELETE FROM usage WHERE request_id=?1 AND model=?2 AND manual=1",
-            params![parent_id, model],
+            params![parent_id, admitted_model],
         )?;
         tx.execute("INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,manual,channel,legacy_channel)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12)", params![id,parent_id,key,model,started,tokens.total,cost,
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12)", params![id,parent_id,key,admitted_model,started,tokens.total,cost,
                 serde_json::to_string(&tokens)?,record["Failed"].as_bool().unwrap_or(false),record["Stream"].as_bool().unwrap_or(false),request_channel,legacy_channel])?;
         tx.execute(
             "UPDATE requests SET status=?1 WHERE request_id=?2 AND model=?3",
             params![
                 if needs_review { "review" } else { "settled" },
                 parent_id,
-                model
+                admitted_model
             ],
         )?;
-        tx.execute("INSERT OR IGNORE INTO models(id) VALUES(?1)", [model])?;
+        tx.execute(
+            "INSERT OR IGNORE INTO models(id) VALUES(?1)",
+            [channel::base_model(model)],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1369,7 +1431,9 @@ impl Engine {
                 "price_source":entry.map(|e| e.2.as_deref().unwrap_or("manual")),
                 "price_source_model":entry.and_then(|e| e.3.as_deref()),
                 "price_synced_at":entry.and_then(|e| e.4.as_deref()),
-                "targets":self.aliases.get(&id)
+                "targets":self.aliases.get(&id).cloned().or_else(|| {
+                    (channel::base_model(&id) != id).then(|| vec![price_model.clone()])
+                })
             }));
         }
         let mut channel_list: Vec<_> = channels
@@ -1430,10 +1494,11 @@ impl Engine {
         } else {
             "channel"
         };
+        let model_values = self.model_scope_values(model)?;
         if reviews {
             let mut stmt = self.db.prepare(&format!("SELECT request_id,model,key_id,started,status,outcome FROM requests
-                WHERE status='review' AND (?1='' OR key_id=?1) AND (?2='' OR model=?2) AND (?4='' OR {channel_field}=?4) ORDER BY started DESC LIMIT 100 OFFSET ?3"))?;
-            let rows = stmt.query_map(params![key,model,offset.max(0),channel], |r| Ok(json!({"request_id":r.get::<_,String>(0)?,
+                WHERE status='review' AND (?1='' OR key_id=?1) AND (?2='[]' OR model IN (SELECT value FROM json_each(?2))) AND (?4='' OR {channel_field}=?4) ORDER BY started DESC LIMIT 100 OFFSET ?3"))?;
+            let rows = stmt.query_map(params![key,model_values,offset.max(0),channel], |r| Ok(json!({"request_id":r.get::<_,String>(0)?,
                 "model":r.get::<_,String>(1)?,"key_id":r.get::<_,String>(2)?,"started":r.get::<_,i64>(3)?,
                 "status":r.get::<_,String>(4)?,"outcome":r.get::<_,Option<String>>(5)?})))?;
             for row in rows {
@@ -1441,8 +1506,8 @@ impl Engine {
             }
         } else {
             let mut stmt = self.db.prepare(&format!("SELECT request_id,model,key_id,started,tokens,cost,detail,failed,stream,manual FROM usage
-                WHERE (?1='' OR key_id=?1) AND (?2='' OR model=?2) AND (?4='' OR {channel_field}=?4) ORDER BY started DESC LIMIT 100 OFFSET ?3"))?;
-            let rows = stmt.query_map(params![key, model, offset.max(0), channel], |r| {
+                WHERE (?1='' OR key_id=?1) AND (?2='[]' OR model IN (SELECT value FROM json_each(?2))) AND (?4='' OR {channel_field}=?4) ORDER BY started DESC LIMIT 100 OFFSET ?3"))?;
+            let rows = stmt.query_map(params![key, model_values, offset.max(0), channel], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -1620,6 +1685,7 @@ pub fn validate_model(model: &str) -> Result<()> {
     Ok(())
 }
 fn stored_price(db: &Connection, model: &str) -> Result<Option<Price>> {
+    let model = channel::base_model(model);
     let text: Option<String> = db
         .query_row("SELECT price FROM prices WHERE model=?1", [model], |r| {
             r.get(0)
@@ -2390,6 +2456,147 @@ mod key_reveal_tests {
             )
             .unwrap();
         assert_eq!(unchanged, 440);
+        fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
+    fn thinking_suffixes_share_prices_and_settle_native_usage() {
+        let raw_key = "sk-thinking-accounting-test";
+        let (mut engine, config_path) = synced_engine(raw_key);
+        let base = "devin/claude-sonnet-5-5";
+        let variant = "devin/claude-sonnet-5-5(medium)";
+        let mut policy = Policy {
+            rule_mode: "channel".into(),
+            ..Policy::default()
+        };
+        policy.channel_rules.insert(
+            "claude".into(),
+            Rule {
+                access: "allow".into(),
+                quota: Some(Quota {
+                    unit: "money".into(),
+                    limit: "50".into(),
+                }),
+            },
+        );
+        store_policy(&engine, &policy);
+        let price = serde_json::from_value(
+            json!({"input":"2","output":"10","cache_read":"0.1","cache_write":"2.5"}),
+        )
+        .unwrap();
+        engine.save_price(base, price, 0).unwrap();
+        let now = Utc::now();
+        engine
+            .db
+            .execute(
+                "INSERT INTO meta(name,value) VALUES('recording_since',?1),('enforcement_enabled','true')",
+                [now.to_rfc3339()],
+            )
+            .unwrap();
+        let request = json!({
+            "RequestID":"thinking-admission",
+            "TraceID":"thinking-trace",
+            "Model":variant,
+            "RequestedModel":base,
+            "Metadata":{"caller_scope":crate::config::caller_scope(raw_key)}
+        });
+        engine.intercept(&request, true, now).unwrap();
+        let admitted: String = engine
+            .db
+            .query_row(
+                "SELECT model FROM requests WHERE request_id='thinking-admission'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(admitted, base);
+        let record = json!({
+            "RequestID":"thinking-execution",
+            "TraceID":"thinking-trace",
+            "APIKey":raw_key,
+            "Model":base,
+            "Provider":"devin",
+            "ExecutorType":"DevinExecutor",
+            "RequestedAt":now.to_rfc3339(),
+            "Detail":{"InputTokens":100,"OutputTokens":10,"TotalTokens":110}
+        });
+        engine.usage(&record, now).unwrap();
+        engine.usage(&record, now).unwrap();
+        let (count, cost, status): (i64, i64, String) = engine.db.query_row(
+            "SELECT COUNT(*),SUM(u.cost),r.status FROM usage u JOIN requests r
+             ON r.request_id=u.request_id AND r.model=u.model WHERE r.request_id='thinking-admission'",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!((count, cost, status.as_str()), (1, 300, "settled"));
+
+        engine
+            .db
+            .execute(
+                "UPDATE usage SET model=?1 WHERE request_id='thinking-admission'",
+                [variant],
+            )
+            .unwrap();
+        engine.db.execute(
+            "UPDATE requests SET model=?1,status='review' WHERE request_id='thinking-admission'",
+            [variant],
+        ).unwrap();
+        engine.db.execute("DELETE FROM usage", []).unwrap();
+        engine
+            .db
+            .execute("INSERT OR IGNORE INTO models(id) VALUES(?1)", [variant])
+            .unwrap();
+        let mut unrelated = record.clone();
+        unrelated["APIKey"] = json!("sk-other-client");
+        engine.usage(&unrelated, now).unwrap();
+        unrelated = record.clone();
+        unrelated["Model"] = json!("devin/claude-sonnet-4-6");
+        engine.usage(&unrelated, now).unwrap();
+        assert_eq!(
+            engine
+                .db
+                .query_row("SELECT COUNT(*) FROM usage", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let key = engine.keys.values().next().unwrap().id.clone();
+        assert_eq!(
+            engine.ledger(&key, base, "", 0, true, now).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        engine.usage(&record, now).unwrap();
+        assert_eq!(
+            engine
+                .db
+                .query_row(
+                    "SELECT status FROM requests WHERE request_id='thinking-admission'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "settled"
+        );
+        let totals = engine.totals(&key, base, 0, i64::MAX).unwrap();
+        assert_eq!(totals["cost_micros"], 300);
+        assert_eq!(
+            engine.ledger(&key, base, "", 0, false, now).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let snapshot = engine.snapshot(now).unwrap();
+        let old = snapshot["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == variant)
+            .unwrap();
+        assert_eq!(old["targets"], json!([base]));
+        assert_eq!(old["price_model"], base);
+        assert_eq!(old["channel"], "claude");
         fs::remove_file(config_path).unwrap();
     }
 
