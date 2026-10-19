@@ -963,12 +963,14 @@ impl Engine {
                     "请求被拒绝：未指定模型。请在请求中填写 model 字段。",
                 )
             })?;
-        if req
-            .pointer("/Metadata/request_path")
-            .and_then(Value::as_str)
-            .is_some_and(|p| p.ends_with("/count_tokens"))
+        if req.pointer("/Metadata/generate") == Some(&Value::Bool(false))
+            || req
+                .pointer("/Metadata/request_path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| p.ends_with("/count_tokens"))
         {
-            // Token counting has no generation cost, but still enforces model permissions.
+            // Counting and host-declared prewarm requests still enforce permissions,
+            // but must not create an admission that their non-generating usage skips.
             if !after && policy.rule_mode == "channel" {
                 return Ok(json!({}));
             }
@@ -1117,6 +1119,22 @@ impl Engine {
             "UPDATE requests SET completed=?1,outcome=?2 WHERE request_id=?3",
             params![now.timestamp_millis(), outcome, rid],
         )?;
+        if req.pointer("/Metadata/generate") == Some(&Value::Bool(false)) {
+            self.settle_non_generation(rid, None)?;
+        }
+        Ok(())
+    }
+    fn settle_non_generation(&self, rid: &str, model: Option<&str>) -> Result<()> {
+        // Older admissions may predate the generate flag check. Close only those
+        // without a ledger; a non-generating notification never erases measured usage.
+        self.db.execute(
+            "UPDATE requests SET status='settled'
+             WHERE request_id=?1 AND (?2 IS NULL OR model=?2)
+             AND status IN ('pending','review')
+             AND NOT EXISTS(SELECT 1 FROM usage u
+                 WHERE u.request_id=requests.request_id AND u.model=requests.model)",
+            params![rid, model],
+        )?;
         Ok(())
     }
     pub fn expire_pending(&mut self, now: DateTime<Utc>) -> Result<()> {
@@ -1125,7 +1143,9 @@ impl Engine {
         Ok(())
     }
     pub fn usage(&mut self, record: &Value, now: DateTime<Utc>) -> Result<()> {
-        if record.get("Generate") == Some(&Value::Bool(false)) {
+        let generate = record.get("Generate") != Some(&Value::Bool(false));
+        if !generate && (string(record, "RequestID").is_none() || string(record, "Model").is_none())
+        {
             return Ok(());
         }
         let raw_key = string(record, "APIKey").unwrap_or("");
@@ -1158,13 +1178,14 @@ impl Engine {
         let trace = string(record, "TraceID").unwrap_or("");
         let requested_at = string(record, "RequestedAt")
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|t| t.timestamp_millis())
-            .unwrap_or(now.timestamp_millis());
+            .map(|t| t.timestamp_millis());
         let pending = {
             let mut statement = self.db.prepare(
                 "SELECT key_id,started,price,request_id,channel,legacy_channel,model
                  FROM requests WHERE (request_id=?1 AND (?4 IS NULL OR key_id=?4))
-                    OR (?3<>'' AND key_id=?4 AND trace_id=?3 AND ABS(started-?5)<86400000)
+                    OR (?3<>'' AND key_id=?4 AND trace_id=?3
+                        AND (?5 IS NULL OR (started<=?5 AND ?5-started<86400000
+                            AND (completed IS NULL OR ?5<=completed))))
                  ORDER BY (request_id=?1) DESC,(model=?2) DESC,started DESC",
             )?;
             let rows = statement.query_map(
@@ -1185,8 +1206,19 @@ impl Engine {
             for row in rows {
                 let row = row?;
                 if channel::base_model(&row.6) == channel::base_model(model) {
+                    if row.3 == rid {
+                        matched = Some(row);
+                        break;
+                    }
+                    // A WebSocket connection can reuse one trace for many executions.
+                    // Match the execution's start interval, never delivery time or the
+                    // newest admission. Overlapping/undated candidates are ambiguous.
+                    if matched.is_some() {
+                        eprintln!("cpa-apikey-manager: 用量通知对应多个准入记录，保留待核对 execution={rid} trace={trace} model={model}");
+                        matched = None;
+                        break;
+                    }
                     matched = Some(row);
-                    break;
                 }
             }
             matched
@@ -1196,10 +1228,13 @@ impl Engine {
                 Some(pending) => pending,
                 None => {
                     // Never infer an earlier admission from today's policy. No credentials in diagnostics.
-                    eprintln!("cpa-apikey-manager: 忽略无法关联准入记录的用量通知");
+                    eprintln!("cpa-apikey-manager: 忽略无法关联准入记录的用量通知 execution={rid} trace={trace} model={model}");
                     return Ok(());
                 }
             };
+        if !generate {
+            return self.settle_non_generation(&parent_id, Some(&admitted_model));
+        }
         let detail: Detail =
             serde_json::from_value(record.get("Detail").cloned().unwrap_or(json!({})))?;
         let mut tokens = accounting::normalize(
@@ -1230,13 +1265,27 @@ impl Engine {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM usage WHERE id=?1)",
-            [&id],
-            |r| r.get(0),
-        )?;
-        if exists {
-            return Ok(());
+        let previous: Option<String> = tx
+            .query_row("SELECT detail FROM usage WHERE id=?1", [&id], |r| r.get(0))
+            .optional()?;
+        let repairing = previous.is_some();
+        if let Some(previous) = previous {
+            let previous: Tokens = serde_json::from_str(&previous)?;
+            // Deduplicate complete records, but let an authoritative complete
+            // notification repair an earlier empty/incomplete record of this execution.
+            if previous.complete || !tokens.complete {
+                return Ok(());
+            }
+        }
+        if !tokens.complete {
+            let manual: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM usage WHERE request_id=?1 AND model=?2 AND manual=1)",
+                params![parent_id, admitted_model],
+                |r| r.get(0),
+            )?;
+            if manual {
+                return Ok(());
+            }
         }
         // An admission without a price snapshot uses the price found since then.
         let price = match price {
@@ -1244,7 +1293,6 @@ impl Engine {
             None => stored_price(&tx, &admitted_model)?,
         };
         let priced = price.as_ref().map(|p| p.cost(&tokens)).transpose();
-        let needs_review = !tokens.complete || priced.is_err();
         let cost = priced.ok().flatten();
         // A late authoritative record replaces a manual settlement, not a second debit.
         tx.execute(
@@ -1252,20 +1300,34 @@ impl Engine {
             params![parent_id, admitted_model],
         )?;
         tx.execute("INSERT INTO usage(id,request_id,key_id,model,started,tokens,cost,detail,failed,stream,manual,channel,legacy_channel)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12)", params![id,parent_id,key,admitted_model,started,tokens.total,cost,
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12)
+            ON CONFLICT(id) DO UPDATE SET tokens=excluded.tokens,cost=excluded.cost,
+                detail=excluded.detail,failed=excluded.failed,stream=excluded.stream",
+            params![id,parent_id,key,admitted_model,started,tokens.total,cost,
                 serde_json::to_string(&tokens)?,record["Failed"].as_bool().unwrap_or(false),record["Stream"].as_bool().unwrap_or(false),request_channel,legacy_channel])?;
         tx.execute(
-            "UPDATE requests SET status=?1 WHERE request_id=?2 AND model=?3",
-            params![
-                if needs_review { "review" } else { "settled" },
-                parent_id,
-                admitted_model
-            ],
+            "UPDATE requests SET status=CASE WHEN EXISTS(
+                SELECT 1 FROM usage WHERE request_id=?1 AND model=?2
+                AND (COALESCE(json_extract(detail,'$.complete'),0)=0
+                    OR (?3 AND cost IS NULL))
+             ) THEN 'review' ELSE 'settled' END WHERE request_id=?1 AND model=?2",
+            params![parent_id, admitted_model, price.is_some()],
         )?;
         tx.execute(
             "INSERT OR IGNORE INTO models(id) VALUES(?1)",
             [channel::base_model(model)],
         )?;
+        if repairing {
+            tx.execute(
+                "INSERT INTO audit(created,action,subject,detail) VALUES(?1,'repair_usage',?2,?3)",
+                params![
+                    now.timestamp_millis(),
+                    parent_id,
+                    json!({"usage_id":id,"model":admitted_model,"tokens":tokens.total,"cost":cost})
+                        .to_string()
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2980,9 +3042,387 @@ mod key_reveal_tests {
         fs::remove_file(config_path).ok();
     }
 
+    struct UsageFixture {
+        engine: Engine,
+        config_path: std::path::PathBuf,
+    }
+
+    impl UsageFixture {
+        fn new() -> Self {
+            let (mut engine, config_path) = synced_engine("sk-usage-recovery-test");
+            store_policy(
+                &engine,
+                &Policy {
+                    total_quota_enabled: true,
+                    total_quota: Some(Quota {
+                        unit: "tokens".into(),
+                        limit: "1000000".into(),
+                    }),
+                    ..Policy::default()
+                },
+            );
+            engine
+                .save_price(
+                    "gpt-6.1-sol",
+                    serde_json::from_value(json!({"input":"2","output":"10"})).unwrap(),
+                    0,
+                )
+                .unwrap();
+            Self {
+                engine,
+                config_path,
+            }
+        }
+
+        fn request(id: &str) -> serde_json::Value {
+            json!({"RequestID":id,"TraceID":"shared-websocket-trace","Model":"gpt-6.1-sol",
+                "Metadata":{"caller_scope":crate::config::caller_scope("sk-usage-recovery-test")}})
+        }
+
+        fn record(id: &str, at: chrono::DateTime<Utc>) -> serde_json::Value {
+            json!({"RequestID":id,"TraceID":"shared-websocket-trace","Model":"gpt-6.1-sol",
+                "APIKey":"sk-usage-recovery-test","Provider":"codex",
+                "RequestedAt":at.to_rfc3339(),"Generate":true,
+                "Detail":{"InputTokens":100,"OutputTokens":10,"TotalTokens":110}})
+        }
+
+        fn status(&self, id: &str) -> String {
+            self.engine
+                .db
+                .query_row(
+                    "SELECT status FROM requests WHERE request_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+    }
+
+    impl Drop for UsageFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.config_path);
+        }
+    }
+
+    #[test]
+    fn non_generating_requests_check_permissions_without_pending_ledger() {
+        let mut fixture = UsageFixture::new();
+        let mut request = UsageFixture::request("prewarm");
+        request["Metadata"]["generate"] = json!(false);
+        let now = Utc::now();
+        fixture.engine.intercept(&request, false, now).unwrap();
+        fixture.engine.intercept(&request, true, now).unwrap();
+        fixture.engine.complete(&request, now).unwrap();
+        fixture
+            .engine
+            .expire_pending(now + chrono::Duration::minutes(1))
+            .unwrap();
+        assert_eq!(
+            fixture
+                .engine
+                .db
+                .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let mut policy = Policy {
+            rule_mode: "channel".into(),
+            ..Policy::default()
+        };
+        policy.channel_rules.insert(
+            "gpt".into(),
+            Rule {
+                access: "deny".into(),
+                quota: None,
+            },
+        );
+        store_policy(&fixture.engine, &policy);
+        assert_eq!(
+            fixture
+                .engine
+                .intercept(&request, true, now)
+                .unwrap_err()
+                .code,
+            "channel_forbidden"
+        );
+    }
+
+    #[test]
+    fn non_generating_usage_closes_only_its_own_admission() {
+        let mut fixture = UsageFixture::new();
+        let now = Utc::now();
+        let first = UsageFixture::request("legacy-prewarm");
+        fixture.engine.intercept(&first, true, now).unwrap();
+        fixture
+            .engine
+            .complete(&first, now + chrono::Duration::seconds(2))
+            .unwrap();
+        let second = UsageFixture::request("generation");
+        fixture
+            .engine
+            .intercept(&second, true, now + chrono::Duration::seconds(3))
+            .unwrap();
+        fixture
+            .engine
+            .complete(&second, now + chrono::Duration::seconds(4))
+            .unwrap();
+        let mut record = UsageFixture::record(
+            "prewarm-execution",
+            now + chrono::Duration::milliseconds(20),
+        );
+        record["Generate"] = json!(false);
+        fixture.engine.usage(&record, now).unwrap();
+        fixture
+            .engine
+            .expire_pending(now + chrono::Duration::minutes(1))
+            .unwrap();
+        assert_eq!(fixture.status("legacy-prewarm"), "settled");
+        assert_eq!(fixture.status("generation"), "review");
+        assert_eq!(
+            fixture
+                .engine
+                .db
+                .query_row("SELECT COUNT(*) FROM usage", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        fixture
+            .engine
+            .usage(&json!({"Generate":false}), now)
+            .unwrap();
+    }
+
+    #[test]
+    fn delayed_usage_matches_its_execution_interval_on_shared_trace() {
+        let mut fixture = UsageFixture::new();
+        let now = Utc::now();
+        let first = UsageFixture::request("first");
+        fixture.engine.intercept(&first, true, now).unwrap();
+        fixture
+            .engine
+            .complete(&first, now + chrono::Duration::seconds(2))
+            .unwrap();
+        let second = UsageFixture::request("second");
+        fixture
+            .engine
+            .intercept(&second, true, now + chrono::Duration::seconds(3))
+            .unwrap();
+        fixture
+            .engine
+            .complete(&second, now + chrono::Duration::seconds(4))
+            .unwrap();
+        for (id, millis) in [("second-execution", 3020), ("first-execution", 20)] {
+            let record = UsageFixture::record(id, now + chrono::Duration::milliseconds(millis));
+            fixture
+                .engine
+                .usage(&record, now + chrono::Duration::seconds(10))
+                .unwrap();
+            fixture
+                .engine
+                .usage(&record, now + chrono::Duration::seconds(10))
+                .unwrap();
+        }
+        assert_eq!(fixture.status("first"), "settled");
+        assert_eq!(fixture.status("second"), "settled");
+        for id in ["first", "second"] {
+            let counts: (i64, i64) = fixture
+                .engine
+                .db
+                .query_row(
+                    "SELECT COUNT(*),SUM(tokens) FROM usage WHERE request_id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(counts, (1, 110));
+        }
+    }
+
+    #[test]
+    fn usage_does_not_guess_between_overlapping_trace_admissions() {
+        let mut fixture = UsageFixture::new();
+        let now = Utc::now();
+        for id in ["concurrent-first", "concurrent-second"] {
+            fixture
+                .engine
+                .intercept(&UsageFixture::request(id), true, now)
+                .unwrap();
+        }
+        let mut record = UsageFixture::record("ambiguous", now);
+        fixture.engine.usage(&record, now).unwrap();
+        record.as_object_mut().unwrap().remove("RequestedAt");
+        fixture.engine.usage(&record, now).unwrap();
+        assert_eq!(
+            fixture
+                .engine
+                .db
+                .query_row("SELECT COUNT(*) FROM usage", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        record["RequestID"] = json!("concurrent-first");
+        fixture.engine.usage(&record, now).unwrap();
+        assert_eq!(fixture.status("concurrent-first"), "settled");
+        assert_eq!(fixture.status("concurrent-second"), "pending");
+    }
+
+    #[test]
+    fn complete_usage_replaces_empty_notification_once() {
+        let mut fixture = UsageFixture::new();
+        let now = Utc::now();
+        fixture
+            .engine
+            .intercept(&UsageFixture::request("admission"), true, now)
+            .unwrap();
+        let complete = UsageFixture::record("execution", now);
+        let mut empty = complete.clone();
+        empty["Detail"] = json!({});
+        fixture.engine.usage(&empty, now).unwrap();
+        assert_eq!(fixture.status("admission"), "review");
+        fixture.engine.usage(&complete, now).unwrap();
+        fixture.engine.usage(&complete, now).unwrap();
+        fixture.engine.usage(&empty, now).unwrap();
+        assert_eq!(fixture.status("admission"), "settled");
+        let totals: (i64, i64, i64) = fixture
+            .engine
+            .db
+            .query_row(
+                "SELECT COUNT(*),SUM(tokens),SUM(cost) FROM usage",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(totals, (1, 110, 300));
+        assert_eq!(
+            fixture
+                .engine
+                .db
+                .query_row(
+                    "SELECT COUNT(*) FROM audit WHERE action='repair_usage'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn complete_retry_does_not_hide_another_incomplete_execution() {
+        let mut fixture = UsageFixture::new();
+        let now = Utc::now();
+        fixture
+            .engine
+            .intercept(&UsageFixture::request("admission"), true, now)
+            .unwrap();
+        let mut empty = UsageFixture::record("first-execution", now);
+        empty["Detail"] = json!({});
+        fixture.engine.usage(&empty, now).unwrap();
+        fixture
+            .engine
+            .usage(&UsageFixture::record("retry-execution", now), now)
+            .unwrap();
+        assert_eq!(fixture.status("admission"), "review");
+        fixture
+            .engine
+            .usage(&UsageFixture::record("first-execution", now), now)
+            .unwrap();
+        assert_eq!(fixture.status("admission"), "settled");
+        let totals: (i64, i64, i64) = fixture
+            .engine
+            .db
+            .query_row(
+                "SELECT COUNT(*),SUM(tokens),SUM(cost) FROM usage",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(totals, (2, 220, 600));
+    }
+
+    #[test]
+    fn non_generating_completion_closes_legacy_admission_without_erasing_usage() {
+        let mut fixture = UsageFixture::new();
+        let now = Utc::now();
+        let mut request = UsageFixture::request("legacy");
+        fixture.engine.intercept(&request, true, now).unwrap();
+        request["Metadata"]["generate"] = json!(false);
+        fixture.engine.complete(&request, now).unwrap();
+        assert_eq!(fixture.status("legacy"), "settled");
+        request["RequestID"] = json!("measured");
+        request["Metadata"]["generate"] = json!(true);
+        fixture.engine.intercept(&request, true, now).unwrap();
+        let mut record = UsageFixture::record("measured", now);
+        record["Detail"] = json!({"InputTokens":100,"TotalTokens":200});
+        fixture.engine.usage(&record, now).unwrap();
+        request["Metadata"]["generate"] = json!(false);
+        fixture.engine.complete(&request, now).unwrap();
+        record["Generate"] = json!(false);
+        fixture.engine.usage(&record, now).unwrap();
+        assert_eq!(fixture.status("measured"), "review");
+        assert_eq!(
+            fixture
+                .engine
+                .db
+                .query_row("SELECT SUM(tokens) FROM usage", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            200
+        );
+    }
+
+    #[test]
+    fn empty_usage_does_not_replace_manual_settlement() {
+        let mut fixture = UsageFixture::new();
+        let now = Utc::now();
+        let request = UsageFixture::request("manual");
+        fixture.engine.intercept(&request, true, now).unwrap();
+        let complete = UsageFixture::record("manual", now);
+        let mut empty = complete.clone();
+        empty["Detail"] = json!({});
+        fixture.engine.usage(&empty, now).unwrap();
+        fixture
+            .engine
+            .settle(
+                "manual",
+                "gpt-6.1-sol",
+                Tokens {
+                    input: 50,
+                    total: 50,
+                    complete: true,
+                    ..Default::default()
+                },
+                now,
+            )
+            .unwrap();
+        fixture.engine.usage(&empty, now).unwrap();
+        assert_eq!(fixture.status("manual"), "settled");
+        let counts: (i64, i64) = fixture
+            .engine
+            .db
+            .query_row("SELECT tokens,manual FROM usage", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(counts, (50, 1));
+        fixture.engine.usage(&complete, now).unwrap();
+        fixture.engine.usage(&complete, now).unwrap();
+        let counts: (i64, i64, i64) = fixture
+            .engine
+            .db
+            .query_row(
+                "SELECT COUNT(*),SUM(tokens),MAX(manual) FROM usage",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 110, 0));
+    }
+
     fn synced_engine(raw_key: &str) -> (Engine, std::path::PathBuf) {
+        let temp_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("temp");
+        fs::create_dir_all(&temp_dir).expect("create test temp directory");
         let config_path =
-            std::env::temp_dir().join(format!("cpa-apikey-manager-{}.yaml", uuid::Uuid::new_v4()));
+            temp_dir.join(format!("cpa-apikey-manager-{}.yaml", uuid::Uuid::new_v4()));
         fs::write(
             &config_path,
             format!("access:\n  api-keys:\n    - {raw_key}\n"),
