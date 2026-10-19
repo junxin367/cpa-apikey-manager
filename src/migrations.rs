@@ -35,7 +35,7 @@ fn v3_channel(model: &str) -> &'static str {
 
 pub fn initialize(db: &mut Connection) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > 5 {
+    if version > 6 {
         return Err(Fault::new(
             503,
             "database_version_unsupported",
@@ -209,6 +209,14 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
         )?;
         tx.commit()?;
     }
+    if version < 6 {
+        // v6 adds the terminal unmeasured request status; table columns are unchanged.
+        db.execute_batch(
+            "CREATE INDEX IF NOT EXISTS requests_unsettled ON requests(status)
+                 WHERE status IN ('pending','review');
+             PRAGMA user_version=6;",
+        )?;
+    }
     Ok(())
 }
 
@@ -293,7 +301,7 @@ mod tests {
         let version: i64 = db
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         initialize(&mut db).unwrap();
         let channel: String = db
             .query_row(

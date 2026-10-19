@@ -179,7 +179,8 @@ pub fn prepare(value: Value) -> Result<Connection> {
     let mut db = Connection::open_in_memory()?;
     crate::migrations::initialize(&mut db)?;
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if archive.data.schema_version != version {
+    // v5 and v6 have identical columns; v6 adds a terminal request status.
+    if archive.data.schema_version != version && archive.data.schema_version != 5 {
         return Err(invalid("备份数据库版本不兼容，请使用匹配的插件版本恢复"));
     }
     let tx = db.transaction()?;
@@ -294,9 +295,18 @@ pub fn prepare(value: Value) -> Result<Connection> {
     }
     drop(statement);
     let invalid_state: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM requests WHERE status NOT IN ('pending','review','settled'))
+        "SELECT EXISTS(SELECT 1 FROM requests WHERE status NOT IN ('pending','review','settled','unmeasured'))
          OR EXISTS(SELECT 1 FROM keys WHERE active NOT IN (0,1))
-         OR EXISTS(SELECT 1 FROM usage WHERE failed NOT IN (0,1) OR stream NOT IN (0,1) OR manual NOT IN (0,1))",
+         OR EXISTS(SELECT 1 FROM usage WHERE failed NOT IN (0,1) OR stream NOT IN (0,1) OR manual NOT IN (0,1))
+         OR EXISTS(SELECT 1 FROM requests r WHERE r.status='unmeasured'
+             AND (r.completed IS NULL OR r.outcome IS NULL
+                 OR r.outcome NOT IN ('failed','canceled','rejected')
+                 OR EXISTS(SELECT 1 FROM usage u WHERE u.request_id=r.request_id AND u.model=r.model
+                     AND (u.manual=1 OR u.tokens<>0 OR COALESCE(u.cost,0)<>0
+                         OR COALESCE(json_extract(u.detail,'$.input'),0)<>0
+                         OR COALESCE(json_extract(u.detail,'$.output'),0)<>0
+                         OR COALESCE(json_extract(u.detail,'$.cache_read'),0)<>0
+                         OR COALESCE(json_extract(u.detail,'$.cache_write'),0)<>0))))",
         [],
         |r| r.get(0),
     )?;
@@ -453,6 +463,84 @@ mod tests {
         value["sha256"] = json!(hex::encode(Sha256::digest(
             serde_json::to_vec(&archive.data).unwrap()
         )));
+    }
+
+    #[test]
+    fn unmeasured_requests_round_trip_and_v5_backups_still_import() {
+        let root = root();
+        let raw = "sk-unmeasured-backup";
+        let now = Utc::now();
+        let mut source = engine(&root.join("source"), raw);
+        let key = source.snapshot(now).unwrap()["keys"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        source
+            .save_policy(
+                &key,
+                Policy {
+                    total_quota_enabled: true,
+                    total_quota: Some(Quota {
+                        unit: "tokens".into(),
+                        limit: "100000".into(),
+                    }),
+                    ..Default::default()
+                },
+                false,
+                now,
+            )
+            .unwrap();
+        let request = json!({"RequestID":"failed","Model":"gpt-6.1-sol","Outcome":"failed",
+            "Metadata":{"caller_scope":crate::config::caller_scope(raw)}});
+        source.intercept(&request, true, now).unwrap();
+        source
+            .usage(
+                &json!({"RequestID":"failed","Model":"gpt-6.1-sol","APIKey":raw,
+            "Provider":"codex","Failed":false,"Detail":{}}),
+                now,
+            )
+            .unwrap();
+        source.complete(&request, now).unwrap();
+        let archive = source.export_backup().unwrap();
+        let mut target = engine(&root.join("target"), raw);
+        target.import_backup(archive.clone(), true).unwrap();
+        assert_eq!(target.snapshot(now).unwrap()["review_count"], 0);
+        assert_eq!(
+            target
+                .db
+                .query_row("SELECT status FROM requests", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "unmeasured"
+        );
+        let mut legacy = archive.clone();
+        legacy["data"]["schema_version"] = json!(5);
+        let status_index = legacy["data"]["tables"]["requests"]["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|c| c == "status")
+            .unwrap();
+        legacy["data"]["tables"]["requests"]["rows"][0][status_index] = json!("review");
+        resign(&mut legacy);
+        target.import_backup(legacy, true).unwrap();
+        assert_eq!(target.snapshot(now).unwrap()["review_count"], 0);
+        assert_eq!(
+            target.export_backup().unwrap()["data"]["tables"]["usage"],
+            archive["data"]["tables"]["usage"]
+        );
+        let mut invalid = archive;
+        let outcome_index = invalid["data"]["tables"]["requests"]["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|c| c == "outcome")
+            .unwrap();
+        invalid["data"]["tables"]["requests"]["rows"][0][outcome_index] = json!("succeeded");
+        resign(&mut invalid);
+        assert!(target.validate_backup(invalid).is_err());
+        drop(target);
+        drop(source);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

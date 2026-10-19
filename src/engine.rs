@@ -257,6 +257,7 @@ impl Engine {
             health_error: None,
             price_sync: None,
         };
+        close_unmeasured_requests(&engine.db, None)?;
         // Keep the plugin active on a broken source, so interceptions can return 503.
         let _ = engine.sync();
         let previous: Option<String> = engine
@@ -646,7 +647,10 @@ impl Engine {
         let (tokens, cost, unpriced, count): (i64, i64, i64, i64) = self.db.query_row(
             &format!(
                 "SELECT COALESCE(SUM(tokens),0),COALESCE(SUM(cost),0),
-             COALESCE(SUM(CASE WHEN cost IS NULL THEN 1 ELSE 0 END),0),COUNT(*)
+             COALESCE(SUM(CASE WHEN cost IS NULL AND NOT EXISTS(
+                 SELECT 1 FROM requests r WHERE r.request_id=usage.request_id
+                     AND r.model=usage.model AND r.status='unmeasured')
+                 THEN 1 ELSE 0 END),0),COUNT(*)
              FROM usage WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4"
             ),
             params![key, &value, start, end],
@@ -776,7 +780,9 @@ impl Engine {
             let filter = scope.filter();
             let mut stmt = self.db.prepare(&format!(
                 "SELECT id,model,detail FROM usage
-                WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4 AND cost IS NULL"
+                WHERE key_id=?1 AND {filter} AND started>=?3 AND started<?4 AND cost IS NULL
+                AND NOT EXISTS(SELECT 1 FROM requests r WHERE r.request_id=usage.request_id
+                    AND r.model=usage.model AND r.status='unmeasured')"
             ))?;
             let rows = stmt.query_map(params![key, scope.value(), start, end], |r| {
                 Ok((
@@ -1122,6 +1128,7 @@ impl Engine {
         if req.pointer("/Metadata/generate") == Some(&Value::Bool(false)) {
             self.settle_non_generation(rid, None)?;
         }
+        close_unmeasured_requests(&self.db, Some(rid))?;
         Ok(())
     }
     fn settle_non_generation(&self, rid: &str, model: Option<&str>) -> Result<()> {
@@ -1138,6 +1145,7 @@ impl Engine {
         Ok(())
     }
     pub fn expire_pending(&mut self, now: DateTime<Utc>) -> Result<()> {
+        close_unmeasured_requests(&self.db, None)?;
         self.db.execute("UPDATE requests SET status='review' WHERE status='pending' AND completed IS NOT NULL AND completed<?1",
             [now.timestamp_millis()-30_000])?;
         Ok(())
@@ -1273,7 +1281,14 @@ impl Engine {
             let previous: Tokens = serde_json::from_str(&previous)?;
             // Deduplicate complete records, but let an authoritative complete
             // notification repair an earlier empty/incomplete record of this execution.
-            if previous.complete || !tokens.complete {
+            let unmeasured: bool = tx.query_row(
+                "SELECT status='unmeasured' FROM requests WHERE request_id=?1 AND model=?2",
+                params![parent_id, admitted_model],
+                |r| r.get(0),
+            )?;
+            if (previous.complete && !(unmeasured && previous.total == 0 && tokens.total > 0))
+                || !tokens.complete
+            {
                 return Ok(());
             }
         }
@@ -1313,6 +1328,7 @@ impl Engine {
              ) THEN 'review' ELSE 'settled' END WHERE request_id=?1 AND model=?2",
             params![parent_id, admitted_model, price.is_some()],
         )?;
+        close_unmeasured_requests(&tx, Some(&parent_id))?;
         tx.execute(
             "INSERT OR IGNORE INTO models(id) VALUES(?1)",
             [channel::base_model(model)],
@@ -1822,8 +1838,11 @@ fn stored_price(db: &Connection, model: &str) -> Result<Option<Price>> {
 /// with incomplete Token counts stay unpriced until reviewed.
 pub fn backfill_unpriced(db: &Connection, model: &str, price: &Price) -> rusqlite::Result<usize> {
     let rows = {
-        let mut stmt =
-            db.prepare("SELECT id,detail,request_id FROM usage WHERE model=?1 AND cost IS NULL")?;
+        let mut stmt = db.prepare(
+            "SELECT id,detail,request_id FROM usage WHERE model=?1 AND cost IS NULL
+             AND NOT EXISTS(SELECT 1 FROM requests r WHERE r.request_id=usage.request_id
+                 AND r.model=usage.model AND r.status='unmeasured')",
+        )?;
         let rows = stmt.query_map([model], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -1840,7 +1859,8 @@ pub fn backfill_unpriced(db: &Connection, model: &str, price: &Price) -> rusqlit
             .and_then(|tokens| price.cost(&tokens));
         let Ok(cost) = cost else {
             db.execute(
-                "UPDATE requests SET status='review' WHERE request_id=?1 AND model=?2",
+                "UPDATE requests SET status='review' WHERE request_id=?1 AND model=?2
+                 AND status<>'unmeasured'",
                 params![rid, model],
             )?;
             continue;
@@ -1862,6 +1882,32 @@ pub fn backfill_unpriced(db: &Connection, model: &str, price: &Price) -> rusqlit
         )?;
     }
     Ok(count)
+}
+
+/// Failed/canceled requests without any reported consumption have nothing for an
+/// administrator to reconcile. Preserve their ledger and unknown cost; late real
+/// usage still follows the ordinary settlement path.
+fn close_unmeasured_requests(db: &Connection, rid: Option<&str>) -> rusqlite::Result<usize> {
+    let statuses = if rid.is_some() {
+        "status IN ('pending','review','settled')"
+    } else {
+        "status IN ('pending','review')"
+    };
+    db.execute(
+        &format!(
+            "UPDATE requests SET status='unmeasured'
+         WHERE (?1 IS NULL OR request_id=?1) AND {statuses}
+         AND completed IS NOT NULL AND outcome IN ('failed','canceled','rejected')
+         AND NOT EXISTS(SELECT 1 FROM usage u
+             WHERE u.request_id=requests.request_id AND u.model=requests.model
+             AND (u.manual=1 OR u.tokens<>0 OR COALESCE(u.cost,0)<>0
+                 OR COALESCE(json_extract(u.detail,'$.input'),0)<>0
+                 OR COALESCE(json_extract(u.detail,'$.output'),0)<>0
+                 OR COALESCE(json_extract(u.detail,'$.cache_read'),0)<>0
+                 OR COALESCE(json_extract(u.detail,'$.cache_write'),0)<>0))"
+        ),
+        [rid],
+    )
 }
 
 #[cfg(test)]
@@ -3416,6 +3462,159 @@ mod key_reveal_tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 110, 0));
+    }
+
+    #[test]
+    fn empty_terminal_failures_do_not_require_manual_review() {
+        for outcome in ["failed", "canceled", "rejected"] {
+            for usage_first in [false, true] {
+                let mut fixture = UsageFixture::new();
+                let now = Utc::now();
+                let mut request = UsageFixture::request("terminated");
+                request["Outcome"] = json!(outcome);
+                fixture.engine.intercept(&request, true, now).unwrap();
+                let mut empty = UsageFixture::record("terminated", now);
+                empty["Detail"] = json!({});
+                // CPA may report Failed=false even after an EOF or downstream cancellation.
+                empty["Failed"] = json!(false);
+                if usage_first {
+                    fixture.engine.usage(&empty, now).unwrap();
+                }
+                fixture.engine.complete(&request, now).unwrap();
+                assert_eq!(fixture.status("terminated"), "unmeasured");
+                if !usage_first {
+                    fixture.engine.usage(&empty, now).unwrap();
+                }
+                fixture.engine.usage(&empty, now).unwrap();
+                fixture
+                    .engine
+                    .expire_pending(now + chrono::Duration::minutes(1))
+                    .unwrap();
+                assert_eq!(fixture.status("terminated"), "unmeasured");
+                let key = fixture.engine.keys.values().next().unwrap().id.clone();
+                let totals = fixture.engine.totals(&key, "", 0, i64::MAX).unwrap();
+                assert_eq!(totals["review"], 0);
+                assert_eq!(totals["pending"], 0);
+                assert_eq!(totals["unpriced"], 0);
+                assert_eq!(totals["cost_micros"], 0);
+                let detail: (String, Option<i64>) = fixture
+                    .engine
+                    .db
+                    .query_row("SELECT detail,cost FROM usage", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .unwrap();
+                assert!(!serde_json::from_str::<Tokens>(&detail.0).unwrap().complete);
+                assert_eq!(
+                    detail.1, None,
+                    "missing measurements must not become a priced zero"
+                );
+
+                let price = fixture.engine.price("gpt-6.1-sol").unwrap().unwrap();
+                super::backfill_unpriced(&fixture.engine.db, "gpt-6.1-sol", &price).unwrap();
+                assert_eq!(fixture.status("terminated"), "unmeasured");
+                let measured = UsageFixture::record("terminated", now);
+                fixture.engine.usage(&measured, now).unwrap();
+                fixture.engine.usage(&measured, now).unwrap();
+                assert_eq!(fixture.status("terminated"), "settled");
+                let totals = fixture.engine.totals(&key, "", 0, i64::MAX).unwrap();
+                assert_eq!(totals["tokens"], "110");
+                assert_eq!(totals["cost_micros"], 300);
+                assert_eq!(totals["requests"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn historical_empty_failures_close_but_actionable_reviews_remain() {
+        let mut fixture = UsageFixture::new();
+        let now = Utc::now();
+        for (id, outcome) in [
+            ("historical-failure", "failed"),
+            ("historical-cancel", "canceled"),
+            ("successful-empty", "succeeded"),
+            ("unknown-empty", "unknown"),
+            ("partial-failure", "failed"),
+            ("manual-failure", "failed"),
+        ] {
+            let mut request = UsageFixture::request(id);
+            request["Outcome"] = json!(outcome);
+            fixture.engine.intercept(&request, true, now).unwrap();
+            let mut record = UsageFixture::record(id, now);
+            record["Detail"] = if id == "partial-failure" {
+                json!({"InputTokens":100,"TotalTokens":200})
+            } else {
+                json!({})
+            };
+            fixture.engine.usage(&record, now).unwrap();
+            if id == "manual-failure" {
+                fixture
+                    .engine
+                    .settle(
+                        id,
+                        "gpt-6.1-sol",
+                        Tokens {
+                            complete: true,
+                            ..Default::default()
+                        },
+                        now,
+                    )
+                    .unwrap();
+            }
+            // Replay the old database state without running the new completion path.
+            fixture
+                .engine
+                .db
+                .execute(
+                    "UPDATE requests SET outcome=?1,completed=?2 WHERE request_id=?3",
+                    rusqlite::params![outcome, now.timestamp_millis(), id],
+                )
+                .unwrap();
+        }
+        fixture.engine.expire_pending(now).unwrap();
+        fixture.engine.expire_pending(now).unwrap();
+        assert_eq!(fixture.status("historical-failure"), "unmeasured");
+        assert_eq!(fixture.status("historical-cancel"), "unmeasured");
+        assert_eq!(fixture.status("successful-empty"), "review");
+        assert_eq!(fixture.status("unknown-empty"), "review");
+        assert_eq!(fixture.status("partial-failure"), "review");
+        assert_eq!(fixture.status("manual-failure"), "settled");
+        let rows: i64 = fixture
+            .engine
+            .db
+            .query_row("SELECT COUNT(*) FROM usage", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 6);
+    }
+
+    #[test]
+    fn late_measured_usage_repairs_a_zero_failure_notification() {
+        let mut fixture = UsageFixture::new();
+        let now = Utc::now();
+        let mut request = UsageFixture::request("failed-empty");
+        request["Outcome"] = json!("failed");
+        fixture.engine.intercept(&request, true, now).unwrap();
+        let mut record = UsageFixture::record("failed-empty", now);
+        record["Failed"] = json!(true);
+        record["Detail"] = json!({});
+        fixture.engine.usage(&record, now).unwrap();
+        fixture.engine.complete(&request, now).unwrap();
+        assert_eq!(fixture.status("failed-empty"), "unmeasured");
+        let mut measured = UsageFixture::record("failed-empty", now);
+        measured["Failed"] = json!(true);
+        fixture.engine.usage(&measured, now).unwrap();
+        fixture.engine.usage(&record, now).unwrap();
+        assert_eq!(fixture.status("failed-empty"), "settled");
+        let totals: (i64, i64, i64) = fixture
+            .engine
+            .db
+            .query_row(
+                "SELECT COUNT(*),SUM(tokens),SUM(cost) FROM usage",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(totals, (1, 110, 300));
     }
 
     fn synced_engine(raw_key: &str) -> (Engine, std::path::PathBuf) {
