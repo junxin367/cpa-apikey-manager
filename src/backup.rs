@@ -21,6 +21,13 @@ const TABLES: [&str; 8] = [
     "audit",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportFilter {
+    ConfigOnly,
+    Since(i64),
+    All,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Table {
@@ -68,16 +75,39 @@ fn columns(db: &Connection, table: &str) -> Result<Vec<Column>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn read_tables(db: &Connection) -> Result<BTreeMap<String, Table>> {
+fn read_tables(db: &Connection, filter: ExportFilter) -> Result<BTreeMap<String, Table>> {
     let mut tables = BTreeMap::new();
     for name in TABLES {
         let names: Vec<_> = columns(db, name)?.into_iter().map(|c| c.name).collect();
-        let mut statement = db.prepare(&format!(
-            "SELECT {} FROM {name} ORDER BY rowid",
-            names.join(",")
-        ))?;
-        let rows = statement.query_map([], |row| {
-            (0..names.len())
+        if filter == ExportFilter::ConfigOnly && matches!(name, "requests" | "usage" | "audit") {
+            tables.insert(
+                name.into(),
+                Table {
+                    columns: names,
+                    rows: Vec::new(),
+                },
+            );
+            continue;
+        }
+        let query_sql = match (name, filter) {
+            ("usage", ExportFilter::Since(_)) => format!(
+                "SELECT {} FROM usage WHERE started >= ?1 ORDER BY rowid",
+                names.join(",")
+            ),
+            ("requests", ExportFilter::Since(_)) => format!(
+                "SELECT {} FROM requests WHERE started >= ?1 OR (request_id, model) IN (SELECT request_id, model FROM usage WHERE started >= ?1) ORDER BY rowid",
+                names.join(",")
+            ),
+            ("audit", ExportFilter::Since(_)) => format!(
+                "SELECT {} FROM audit WHERE created >= ?1 ORDER BY rowid",
+                names.join(",")
+            ),
+            _ => format!("SELECT {} FROM {name} ORDER BY rowid", names.join(",")),
+        };
+        let mut statement = db.prepare(&query_sql)?;
+        let len = names.len();
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<Vec<Option<String>>> {
+            (0..len)
                 .map(|index| match row.get_ref(index)? {
                     rusqlite::types::ValueRef::Null => Ok(None),
                     rusqlite::types::ValueRef::Integer(value) => Ok(Some(value.to_string())),
@@ -86,9 +116,18 @@ fn read_tables(db: &Connection) -> Result<BTreeMap<String, Table>> {
                     }
                     _ => Err(rusqlite::Error::InvalidQuery),
                 })
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })?;
-        let rows = rows.collect::<rusqlite::Result<_>>()?;
+                .collect()
+        };
+        let rows: Vec<Vec<Option<String>>> = match filter {
+            ExportFilter::Since(start_ms) if matches!(name, "usage" | "requests" | "audit") => {
+                statement
+                    .query_map([start_ms], map_row)?
+                    .collect::<rusqlite::Result<_>>()?
+            }
+            _ => statement
+                .query_map([], map_row)?
+                .collect::<rusqlite::Result<_>>()?,
+        };
         tables.insert(
             name.into(),
             Table {
@@ -100,7 +139,7 @@ fn read_tables(db: &Connection) -> Result<BTreeMap<String, Table>> {
     Ok(tables)
 }
 
-pub fn export(db: &mut Connection) -> Result<Value> {
+pub fn export(db: &mut Connection, filter: ExportFilter) -> Result<Value> {
     let tx = db.transaction()?;
     let data = Data {
         format: "cpa-apikey-manager-backup".into(),
@@ -108,7 +147,7 @@ pub fn export(db: &mut Connection) -> Result<Value> {
         plugin_version: env!("CARGO_PKG_VERSION").into(),
         exported_at: Utc::now().to_rfc3339(),
         schema_version: tx.pragma_query_value(None, "user_version", |row| row.get(0))?,
-        tables: read_tables(&tx)?,
+        tables: read_tables(&tx, filter)?,
     };
     let sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&data)?));
     let archive = serde_json::to_value(Archive { data, sha256 })?;
@@ -381,7 +420,7 @@ pub fn summary(db: &Connection) -> Result<Value> {
 }
 
 pub fn replace(db: &mut Connection, source: &Connection) -> Result<()> {
-    let tables = read_tables(source)?;
+    let tables = read_tables(source, ExportFilter::All)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for name in TABLES.into_iter().rev() {
         tx.execute(&format!("DELETE FROM {name}"), [])?;
@@ -501,7 +540,7 @@ mod tests {
             )
             .unwrap();
         source.complete(&request, now).unwrap();
-        let archive = source.export_backup().unwrap();
+        let archive = source.export_backup(None).unwrap();
         let mut target = engine(&root.join("target"), raw);
         target.import_backup(archive.clone(), true).unwrap();
         assert_eq!(target.snapshot(now).unwrap()["review_count"], 0);
@@ -525,7 +564,7 @@ mod tests {
         target.import_backup(legacy, true).unwrap();
         assert_eq!(target.snapshot(now).unwrap()["review_count"], 0);
         assert_eq!(
-            target.export_backup().unwrap()["data"]["tables"]["usage"],
+            target.export_backup(None).unwrap()["data"]["tables"]["usage"],
             archive["data"]["tables"]["usage"]
         );
         let mut invalid = archive;
@@ -575,7 +614,7 @@ mod tests {
             )
             .unwrap();
         target.set_enforcement_enabled(true).unwrap();
-        let archive = target.export_backup().unwrap();
+        let archive = target.export_backup(None).unwrap();
         let request = json!({"RequestID":"ongoing-across-import","Model":"gpt-5.5","RequestedModel":"gpt-5.5",
             "Metadata":{"caller_scope":crate::config::caller_scope(raw)}});
         target.intercept(&request, true, Utc::now()).unwrap();
@@ -585,7 +624,7 @@ mod tests {
         let total =
             target.snapshot(Utc::now()).unwrap()["keys"][0]["total_usage"]["tokens"].clone();
         let mut source = engine(&root.join("source"), raw);
-        let foreign = source.export_backup().unwrap();
+        let foreign = source.export_backup(None).unwrap();
         let request = json!({"RequestID":"ongoing-new-secret","Model":"gpt-5.5","RequestedModel":"gpt-5.5",
             "Metadata":{"caller_scope":crate::config::caller_scope(raw)}});
         target.intercept(&request, true, Utc::now()).unwrap();
@@ -599,7 +638,7 @@ mod tests {
             .db
             .query_row("SELECT COUNT(*) FROM usage", [], |row| row.get(0))
             .unwrap();
-        let good = target.export_backup().unwrap();
+        let good = target.export_backup(None).unwrap();
         let mut orphan = good.clone();
         orphan["data"]["tables"]["requests"]["rows"] = json!([]);
         resign(&mut orphan);
@@ -628,7 +667,7 @@ mod tests {
     fn backup_rejects_invalid_permission_fields() {
         let root = root();
         let mut target = engine(&root, "sk-import-policy-probe");
-        let mut archive = target.export_backup().unwrap();
+        let mut archive = target.export_backup(None).unwrap();
         let columns = archive["data"]["tables"]["keys"]["columns"]
             .as_array()
             .unwrap();
@@ -708,7 +747,7 @@ mod tests {
             "INSERT INTO audit(created,action,subject,detail) VALUES(?1,'large_integer','test','')",
             [9_007_199_254_740_993_i64],
         ).unwrap();
-        let archive = source.export_backup().unwrap();
+        let archive = source.export_backup(None).unwrap();
         assert!(!archive.to_string().contains(raw));
         assert!(archive.to_string().contains("\"9007199254740993\""));
         let mut target = engine(&root.join("target"), raw);
@@ -757,7 +796,7 @@ mod tests {
     fn invalid_and_unconfirmed_backups_never_change_current_data() {
         let root = root();
         let mut target = engine(&root, "sk-backup-test-current");
-        let archive = target.export_backup().unwrap();
+        let archive = target.export_backup(None).unwrap();
         let before = archive["data"]["tables"].clone();
         assert_eq!(
             target
@@ -801,7 +840,7 @@ mod tests {
             target.import_backup(duplicate, true).unwrap_err().code,
             "invalid_backup"
         );
-        let after = target.export_backup().unwrap();
+        let after = target.export_backup(None).unwrap();
         assert_eq!(before["keys"], after["data"]["tables"]["keys"]);
         assert_eq!(before["usage"], after["data"]["tables"]["usage"]);
         assert_eq!(before["prices"], after["data"]["tables"]["prices"]);
@@ -826,14 +865,14 @@ mod tests {
                 0,
             )
             .unwrap();
-        let archive = source.export_backup().unwrap();
+        let archive = source.export_backup(None).unwrap();
         let mut target = engine(&root.join("target"), "sk-backup-test");
-        let original = target.export_backup().unwrap()["data"]["tables"].clone();
+        let original = target.export_backup(None).unwrap()["data"]["tables"].clone();
         target.db.execute_batch(
             "CREATE TEMP TRIGGER fail_import BEFORE INSERT ON prices BEGIN SELECT RAISE(ABORT,'test failure'); END;",
         ).unwrap();
         assert!(target.import_backup(archive, true).is_err());
-        let after = target.export_backup().unwrap()["data"]["tables"].clone();
+        let after = target.export_backup(None).unwrap()["data"]["tables"].clone();
         assert_eq!(after, original);
         assert_eq!(
             target.price_sync.as_ref().unwrap().status()["enabled"],
@@ -842,12 +881,15 @@ mod tests {
         target.db.execute_batch("DROP TRIGGER fail_import").unwrap();
         let original_directory = target.config.data_dir.clone();
         target.config.data_dir = target.config.cpa_config_path.clone();
-        let archive = source.export_backup().unwrap();
+        let archive = source.export_backup(None).unwrap();
         assert_eq!(
             target.import_backup(archive, true).unwrap_err().code,
             "backup_save_failed"
         );
-        assert_eq!(target.export_backup().unwrap()["data"]["tables"], original);
+        assert_eq!(
+            target.export_backup(None).unwrap()["data"]["tables"],
+            original
+        );
         target.config.data_dir = original_directory;
         assert!(fs::read_dir(root.join("target")).unwrap().any(|entry| entry
             .unwrap()
@@ -870,7 +912,7 @@ mod tests {
         let mut target = engine(&root.join("target"), "sk-backup-current");
         let config_before = fs::read(&target.config.cpa_config_path).unwrap();
         target
-            .import_backup(source.export_backup().unwrap(), true)
+            .import_backup(source.export_backup(None).unwrap(), true)
             .unwrap();
         assert_eq!(
             fs::read(&target.config.cpa_config_path).unwrap(),
@@ -894,6 +936,121 @@ mod tests {
             2
         );
         drop(source);
+        drop(target);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn export_range_filters_appropriately() {
+        let root = root();
+        let mut target = engine(&root, "sk-export-range-test");
+        let key = target.snapshot(Utc::now()).unwrap()["keys"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        target
+            .save_policy(
+                &key,
+                Policy {
+                    total_quota_enabled: true,
+                    total_quota: Some(Quota {
+                        unit: "tokens".into(),
+                        limit: "100000".into(),
+                    }),
+                    ..Policy::default()
+                },
+                false,
+                Utc::now(),
+            )
+            .unwrap();
+        target
+            .save_price(
+                "gpt-5.5",
+                serde_json::from_value(json!({"input":"1","output":"2"})).unwrap(),
+                0,
+            )
+            .unwrap();
+        let now = Utc::now();
+        let req = json!({"RequestID":"range-test-req","Model":"gpt-5.5","RequestedModel":"gpt-5.5",
+            "Metadata":{"caller_scope":crate::config::caller_scope("sk-export-range-test")}});
+        target.intercept(&req, true, now).unwrap();
+        target.usage(&json!({"RequestID":"range-test-req","APIKey":"sk-export-range-test","Model":"gpt-5.5","Provider":"openai",
+            "Detail":{"InputTokens":10,"OutputTokens":5,"TotalTokens":15}}), now).unwrap();
+
+        // 1. 导出 config 范围：无流水明细，但校验和导入必须通过
+        let config_archive = target.export_backup(Some("config")).unwrap();
+        assert_eq!(
+            config_archive["data"]["tables"]["requests"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            config_archive["data"]["tables"]["usage"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            config_archive["data"]["tables"]["audit"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(
+            config_archive["data"]["tables"]["keys"]["rows"]
+                .as_array()
+                .unwrap()
+                .len()
+                > 0
+        );
+        assert!(
+            config_archive["data"]["tables"]["prices"]["rows"]
+                .as_array()
+                .unwrap()
+                .len()
+                > 0
+        );
+        target.validate_backup(config_archive.clone()).unwrap();
+
+        // 2. 导出 week 范围：包含当前周数据
+        let week_archive = target.export_backup(Some("week")).unwrap();
+        assert_eq!(
+            week_archive["data"]["tables"]["usage"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            week_archive["data"]["tables"]["requests"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        target.validate_backup(week_archive).unwrap();
+
+        // 3. 导出 month 范围：包含当前月数据
+        let month_archive = target.export_backup(Some("month")).unwrap();
+        assert_eq!(
+            month_archive["data"]["tables"]["usage"]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        target.validate_backup(month_archive).unwrap();
+
+        // 4. 非法范围报错
+        assert_eq!(
+            target.export_backup(Some("invalid")).unwrap_err().code,
+            "invalid_range"
+        );
+
         drop(target);
         fs::remove_dir_all(root).unwrap();
     }

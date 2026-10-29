@@ -431,6 +431,7 @@ th.num, td.num { text-align: right; }
 .credential-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
 .credential-row .secret-field { flex: 1 1 320px; }
 .credential-row .primary { height: var(--control-large); min-width: 112px; }
+.backup-range-dropdown { width: auto; min-width: 220px; }
 .backup-import-hint { display: inline-flex; }
 .backup-import-hint[title]:not([title=""]) { cursor: not-allowed; }
 .backup-import-hint button:disabled { pointer-events: none; }

@@ -283,8 +283,31 @@ impl Engine {
         hmac.update(key.trim().as_bytes());
         hex::encode(hmac.finalize().into_bytes())
     }
-    pub fn export_backup(&mut self) -> Result<Value> {
-        crate::backup::export(&mut self.db)
+    pub fn export_backup(&mut self, range: Option<&str>) -> Result<Value> {
+        let filter = match range {
+            Some("config") => crate::backup::ExportFilter::ConfigOnly,
+            Some("week") => {
+                let now = Utc::now();
+                let zone = self.timezone()?;
+                let (start, _) = crate::accounting::period_bounds(now, zone, "week")?;
+                crate::backup::ExportFilter::Since(start)
+            }
+            Some("month") | None | Some("") => {
+                let now = Utc::now();
+                let zone = self.timezone()?;
+                let (start, _) = crate::accounting::period_bounds(now, zone, "month")?;
+                crate::backup::ExportFilter::Since(start)
+            }
+            Some("all") => crate::backup::ExportFilter::All,
+            Some(_) => {
+                return Err(Fault::new(
+                    400,
+                    "invalid_range",
+                    "导出范围必须为 month、week 或 config",
+                ))
+            }
+        };
+        crate::backup::export(&mut self.db, filter)
     }
     fn prepare_backup(&self, value: Value) -> Result<Self> {
         let db = crate::backup::prepare(value)?;
@@ -347,7 +370,7 @@ impl Engine {
         let worker = self.price_sync.take();
         let pause = worker.as_ref().map(crate::price_sync::Worker::pause);
         let result = (|| {
-            let current = self.export_backup()?;
+            let current = self.export_backup(Some("month"))?;
             let rollback = crate::backup::save_rollback(&self.config.data_dir, &current)?;
             crate::backup::replace(&mut self.db, &restored.db)?;
             Ok::<_, Fault>(rollback)

@@ -163,7 +163,11 @@ fn action(engine: &mut Engine, req: &Value) -> Result<Value> {
     };
     match (method, route) {
         ("GET", "/state") => engine.snapshot(Utc::now()),
-        ("GET", "/backup/export") => engine.export_backup(),
+        ("GET", "/backup/export") => {
+            let range = query(req, "range");
+            let range_opt = if range.is_empty() { None } else { Some(range) };
+            engine.export_backup(range_opt)
+        }
         ("POST", "/backup/validate") => engine.validate_backup(data["backup"].clone()),
         ("POST", "/backup/import") => engine.import_backup(
             data["backup"].clone(),

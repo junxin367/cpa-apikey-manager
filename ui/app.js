@@ -266,25 +266,42 @@ function renderCredentialState(message = "") {
   renderTimezoneSetting();
   renderEnforcementState();
 }
+let exportRangePicker = null;
+function getExportRangePicker() {
+  if (!exportRangePicker) {
+    exportRangePicker = dropdown([
+      ["month", "本月数据（自然月）"],
+      ["week", "本周数据（自然周）"],
+      ["config", "仅配置与价格规则（无流水）"],
+    ], "month", "备份导出范围");
+    exportRangePicker.root.classList.add("backup-range-dropdown");
+    const slot = $("export-backup-range-control");
+    if (slot) slot.append(exportRangePicker.root);
+  }
+  return exportRangePicker;
+}
 function renderBackupSettings() {
   const connected = !!token && !!snapshot;
+  const picker = getExportRangePicker();
+  if (picker) picker.disabled = !connected || savingBackup;
   $("export-backup").disabled = !connected || savingBackup;
   $("import-backup").disabled = !connected || savingBackup;
   $("import-backup-hint").title = !connected ? "请先连接管理接口，再导入备份"
     : savingBackup ? "备份正在处理，请稍候再导入"
     : "";
   $("backup-detail").textContent = !connected ? "连接后可导出、导入备份。"
-    : "支持 JSON 文件，最大 128 MB。";
+    : "支持 JSON 文件，最大 128 MB。导出可选本月、本周或仅配置。";
 }
 $("export-backup").onclick = () => guard(async () => {
   if (savingBackup) return;
   savingBackup = true; const restore = pendingButton($("export-backup"), "导出中…");
   renderBackupSettings();
   try {
-    const archive = await api("/backup/export", "GET", undefined, 90000);
+    const range = getExportRangePicker()?.value || "month";
+    const archive = await api("/backup/export?range=" + encodeURIComponent(range), "GET", undefined, 90000);
     const file = new Blob([JSON.stringify(archive)], { type: "application/json" });
     const url = URL.createObjectURL(file);
-    const name = "cpa-apikey-manager-backup-" + archive.data.exported_at.replace(/[:.]/g, "-") + ".json";
+    const name = "cpa-apikey-manager-backup-" + range + "-" + archive.data.exported_at.replace(/[:.]/g, "-") + ".json";
     const link = el("a", { href: url, download: name }); document.body.append(link); link.click(); link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     $("backup-result").textContent = "已生成备份：" + name + "，请确认下载完成并保存到容器之外。";
