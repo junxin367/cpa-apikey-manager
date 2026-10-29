@@ -274,7 +274,7 @@ function renderBackupSettings() {
     : savingBackup ? "备份正在处理，请稍候再导入"
     : "";
   $("backup-detail").textContent = !connected ? "连接后可导出、导入备份。"
-    : "支持 JSON 文件，最大 64 MB。";
+    : "支持 JSON 文件，最大 128 MB。";
 }
 $("export-backup").onclick = () => guard(async () => {
   if (savingBackup) return;
@@ -299,7 +299,7 @@ $("backup-file").onchange = () => guard(async () => {
   renderBackupSettings();
   let archive, summary;
   try {
-    if (file.size > 64 * 1024 * 1024) throw new Error("备份文件超过 64 MB");
+    if (file.size > 128 * 1024 * 1024) throw new Error("备份文件超过 128 MB");
     try { archive = JSON.parse(await file.text()); } catch { throw new Error("文件不是有效的 JSON 备份"); }
     summary = await api("/backup/validate", "POST", { backup: archive }, 90000);
   }

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs::OpenOptions, io::Write, path::Path};
 
-pub const MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_BYTES: usize = 128 * 1024 * 1024;
 const TABLES: [&str; 8] = [
     "meta",
     "keys",
@@ -116,7 +116,7 @@ pub fn export(db: &mut Connection) -> Result<Value> {
         return Err(Fault::new(
             413,
             "backup_too_large",
-            "备份超过 64 MB，请停止宿主后备份整个数据目录",
+            "备份超过 128 MB，请停止宿主后备份整个数据目录",
         ));
     }
     tx.commit()?;
